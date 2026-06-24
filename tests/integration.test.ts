@@ -18,6 +18,9 @@ const TEST_DIR = "/tmp/haiflow-integration-test";
 const TEST_API_KEY = "integration-test-key";
 const BASE = `http://localhost:${TEST_PORT}`;
 const TIMEOUT = 120_000; // 2 min per test — Claude needs time
+// These start a REAL Claude session, so skip when the CLI isn't installed
+// (e.g. CI). Locally, with Claude on PATH, they run.
+const HAS_CLAUDE = !!Bun.which("claude");
 
 let server: ReturnType<typeof Bun.spawn>;
 
@@ -75,7 +78,7 @@ beforeAll(async () => {
   });
 
   // Wait for server to be ready
-  for (let i = 0; i < 30; i++) {
+  for (let i = 0; i < 150; i++) {
     try {
       const res = await fetch(`${BASE}/health`);
       if (res.ok) return;
@@ -111,7 +114,7 @@ afterAll(async () => {
 // --- Full lifecycle ---
 
 describe("session lifecycle", () => {
-  test(
+  test.skipIf(!HAS_CLAUDE)(
     "start session → trigger → stream → response → stop",
     async () => {
       // 1. Start session
@@ -179,7 +182,7 @@ describe("session lifecycle", () => {
 });
 
 describe("queue draining", () => {
-  test(
+  test.skipIf(!HAS_CLAUDE)(
     "queues prompt when busy and drains when idle",
     async () => {
       // Start session

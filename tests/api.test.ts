@@ -46,7 +46,7 @@ beforeAll(async () => {
     stderr: "ignore",
   });
 
-  for (let i = 0; i < 30; i++) {
+  for (let i = 0; i < 150; i++) {
     try {
       const res = await fetch(`${BASE}/health`);
       if (res.ok) return;
@@ -122,6 +122,15 @@ describe("POST /session/start", () => {
     });
     // Will fail with 409 or succeed depending on tmux, but session name should be sanitized
     expect(status).toBeOneOf([200, 409]);
+  });
+
+  // Runs only where the Claude CLI is absent (e.g. CI). Locks in the fast-fail:
+  // without this guard /session/start hangs ~45s on the readiness/guardrail
+  // waits instead of returning a clear error.
+  test.skipIf(!!Bun.which("claude"))("fails fast with 409 when the claude CLI is absent", async () => {
+    const { status, data } = await api("/session/start", "POST", { session: "no-claude", cwd: "/tmp" });
+    expect(status).toBe(409);
+    expect(data.error).toContain("claude");
   });
 });
 
@@ -455,6 +464,59 @@ describe("POST /hooks/prompt", () => {
   });
 });
 
+describe("GET /version", () => {
+  test("returns version, startedAt and redis status without auth", async () => {
+    // No Authorization header — /version is unauthenticated like /health.
+    const res = await fetch(`${BASE}/version`);
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(typeof data.version).toBe("string");
+    expect(data.version.length).toBeGreaterThan(0);
+    expect(typeof data.startedAt).toBe("string");
+    expect(typeof data.redis).toBe("boolean");
+  });
+});
+
+describe("malformed request bodies", () => {
+  test("POST /trigger with invalid JSON returns 400, not 500", async () => {
+    const res = await fetch(`${BASE}/trigger`, {
+      method: "POST",
+      headers: { ...authHeaders, "Content-Type": "application/json" },
+      body: "{ not valid json",
+    });
+    expect(res.status).toBe(400);
+    const data = await res.json();
+    expect(data.error).toContain("Invalid or empty JSON");
+  });
+
+  test("POST /trigger with an empty body returns 400", async () => {
+    const res = await fetch(`${BASE}/trigger`, { method: "POST", headers: authHeaders });
+    expect(res.status).toBe(400);
+  });
+});
+
+describe("POST /sessions/prune", () => {
+  test("reaps stale offline sessions, keeps recent and non-offline ones", async () => {
+    const old = new Date(Date.now() - 48 * 3_600_000).toISOString();
+    const fresh = new Date().toISOString();
+    writeState("prune-old", { status: "offline", since: old });
+    writeState("prune-recent", { status: "offline", since: fresh });
+    writeState("prune-idle", { status: "idle", since: old });
+
+    const { status, data } = await api("/sessions/prune", "POST", {});
+    expect(status).toBe(200);
+    expect(data.pruned).toContain("prune-old");
+    expect(data.pruned).not.toContain("prune-recent");
+    expect(data.pruned).not.toContain("prune-idle");
+
+    const { data: list } = await api("/sessions");
+    const names = list.map((s: any) => s.session);
+    expect(names).not.toContain("prune-old");
+    expect(names).toContain("prune-recent");
+    expect(names).toContain("prune-idle");
+  });
+});
+
 describe("POST /hooks/stop", () => {
   test("returns ok for unknown session", async () => {
     const { data } = await api("/hooks/stop", "POST", {
@@ -495,6 +557,65 @@ describe("POST /hooks/stop (known session)", () => {
     const { status, data: resp } = await api(`/responses/stop-task-001?session=${session}`);
     expect(status).toBe(200);
     expect(resp.messages).toEqual(["I finished the work."]);
+  });
+
+  test("writes a definitive completion when there is no transcript or last message", async () => {
+    const session = "hook-stop-empty";
+    const claudeId = "claude-stop-empty-id";
+    const dir = `${TEST_DIR}/${session}`;
+    mkdirSync(`${dir}/responses`, { recursive: true });
+    writeFileSync(`${dir}/session-id`, claudeId);
+    writeFileSync(
+      `${dir}/state.json`,
+      JSON.stringify({
+        status: "busy",
+        since: new Date().toISOString(),
+        currentTaskId: "stop-empty-001",
+      })
+    );
+
+    // No transcript_path and no last_assistant_message: the task ended with no
+    // trailing text. A response file must still be written, or pollers and SSE
+    // streams hang until timeout.
+    const { data } = await api("/hooks/stop", "POST", { session_id: claudeId });
+    expect(data.ok).toBe(true);
+
+    const { status, data: resp } = await api(`/responses/stop-empty-001?session=${session}`);
+    expect(status).toBe(200);
+    expect(resp.messages).toEqual(["(no text output)"]);
+  });
+
+  test("captures assistant messages from the transcript (no jq dependency)", async () => {
+    const session = "hook-stop-transcript";
+    const claudeId = "claude-stop-transcript-id";
+    const dir = `${TEST_DIR}/${session}`;
+    mkdirSync(`${dir}/responses`, { recursive: true });
+    writeFileSync(`${dir}/session-id`, claudeId);
+    writeFileSync(
+      `${dir}/state.json`,
+      JSON.stringify({ status: "busy", since: new Date().toISOString(), currentTaskId: "stop-transcript-001" })
+    );
+
+    // Minimal transcript under an allowed prefix (/tmp/claude). saveResponse now
+    // reuses extractFromTranscript instead of shelling out to jq.
+    mkdirSync("/tmp/claude", { recursive: true });
+    const tpath = "/tmp/claude/haiflow-test-transcript.jsonl";
+    writeFileSync(tpath, [
+      JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "text", text: "do the thing" }] } }),
+      JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Transcript answer." }], usage: { output_tokens: 3 } } }),
+    ].join("\n"));
+
+    try {
+      // No last_assistant_message, so the transcript extraction must supply the text.
+      const { data } = await api("/hooks/stop", "POST", { session_id: claudeId, transcript_path: tpath });
+      expect(data.ok).toBe(true);
+
+      const { status, data: resp } = await api(`/responses/stop-transcript-001?session=${session}`);
+      expect(status).toBe(200);
+      expect(resp.messages).toEqual(["Transcript answer."]);
+    } finally {
+      if (existsSync(tpath)) unlinkSync(tpath);
+    }
   });
 
   test("drains queue after stop", async () => {

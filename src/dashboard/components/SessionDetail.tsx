@@ -1,24 +1,25 @@
 import React, { useState, useCallback } from "react";
-import { getStatus, getQueue, getResponses, getResponse, clearQueue, clearResponses, stopSession, AuthError } from "../api";
+import { getStatus, getQueue, getResponses, getResponse, clearQueue, clearResponses, stopSession, interruptSession, cancelQueueItem, AuthError } from "../api";
 import { TriggerForm } from "./TriggerForm";
 import { TerminalView } from "./TerminalView";
+import { HistoryView } from "./HistoryView";
 import { Badge, Skeleton, SkeletonLine, EmptyState, Card, StatCard, InboxIcon, MessageIcon, useToast } from "./ui";
 import { usePolling } from "../hooks";
 import { timeAgo } from "../utils";
 import type { Status, QueueItem, ResponseItem } from "../types";
 
-type Tab = "terminal" | "queue" | "responses";
+type Tab = "terminal" | "queue" | "responses" | "history";
 
 function ExpandableResponse({ session, id, completedAt }: { session: string; id: string; completedAt: string }) {
   const [open, setOpen] = useState(false);
-  const [data, setData] = useState<{ prompt?: string; messages?: string[] } | null>(null);
+  const [data, setData] = useState<{ prompt?: string; messages?: string[]; redactions?: number } | null>(null);
 
   const load = async () => {
     if (data) { setOpen(!open); return; }
     setOpen(true);
     try {
       const res = await getResponse(session, id);
-      setData({ prompt: res.data.prompt, messages: res.data.messages || [] });
+      setData({ prompt: res.data.prompt, messages: res.data.messages || [], redactions: res.data.redactions });
     } catch {
       setData({ messages: ["Failed to load response"] });
     }
@@ -43,6 +44,11 @@ function ExpandableResponse({ session, id, completedAt }: { session: string; id:
           )}
           <div>
             <span className="text-[10px] uppercase tracking-wider text-gray-600 font-medium">Response</span>
+            {data.redactions ? (
+              <span className="ml-2 text-[10px] text-amber-400/80" title="Secret-shaped strings were redacted from this response before storage">
+                {data.redactions} redaction{data.redactions === 1 ? "" : "s"}
+              </span>
+            ) : null}
             {data.messages?.map((msg, i) => (
               <pre key={i} className="text-xs text-gray-300 bg-gray-800 rounded p-2 mt-0.5 whitespace-pre-wrap break-words overflow-x-auto">
                 {msg}
@@ -55,17 +61,26 @@ function ExpandableResponse({ session, id, completedAt }: { session: string; id:
   );
 }
 
-function ExpandableQueueItem({ item }: { item: QueueItem }) {
+function ExpandableQueueItem({ item, onCancel }: { item: QueueItem; onCancel: (id: string) => void }) {
   const [open, setOpen] = useState(false);
 
   return (
     <div className="border-b border-gray-800 last:border-b-0">
-      <button onClick={() => setOpen(!open)} className="w-full text-left px-3 py-2 flex items-center gap-3 hover:bg-gray-800/50 transition-colors text-sm">
-        <span className="text-gray-400 font-mono text-xs truncate flex-1">{item.id}</span>
-        <span className="text-gray-300 truncate max-w-48" title={item.prompt}>{item.prompt}</span>
+      <div className="w-full px-3 py-2 flex items-center gap-3 hover:bg-gray-800/50 transition-colors text-sm">
+        <button onClick={() => setOpen(!open)} className="flex items-center gap-3 text-left flex-1 min-w-0">
+          <span className="text-gray-400 font-mono text-xs truncate">{item.id}</span>
+          <span className="text-gray-300 truncate max-w-48" title={item.prompt}>{item.prompt}</span>
+        </button>
         <span className="text-xs text-gray-600 shrink-0">{timeAgo(item.addedAt)}</span>
-        <span className="text-xs text-gray-600 shrink-0">{open ? "−" : "+"}</span>
-      </button>
+        <button
+          onClick={(e) => { e.stopPropagation(); onCancel(item.id); }}
+          className="text-xs text-red-400/70 hover:text-red-300 shrink-0"
+          title="Remove from queue"
+        >
+          ×
+        </button>
+        <button onClick={() => setOpen(!open)} className="text-xs text-gray-600 shrink-0">{open ? "−" : "+"}</button>
+      </div>
       {open && (
         <div className="px-3 pb-3 animate-[fadeIn_150ms_ease-out]">
           {item.source && (
@@ -166,9 +181,22 @@ export function SessionDetail({ session, onRefresh }: { session: string; onRefre
     fetchAll();
   };
 
+  const handleCancelQueueItem = async (id: string) => {
+    await cancelQueueItem(session, id);
+    toast("Removed from queue", "success");
+    fetchAll();
+  };
+
   const handleClearResponses = async () => {
     await clearResponses(session);
     toast("Responses cleared", "success");
+    fetchAll();
+  };
+
+  const handleInterrupt = async () => {
+    const res = await interruptSession(session);
+    if (res.status === 200) toast("Interrupt sent", "success");
+    else toast(res.data?.error || "Interrupt failed", "error");
     fetchAll();
   };
 
@@ -195,6 +223,22 @@ export function SessionDetail({ session, onRefresh }: { session: string; onRefre
           </button>
         )}
       </div>
+
+      {/* Waiting / wedged banner */}
+      {status.waiting && (
+        <div className="flex items-center gap-3 bg-amber-500/10 border border-amber-500/30 rounded-lg p-3 animate-[fadeIn_200ms_ease-out]">
+          <span className="text-amber-400 text-sm shrink-0">⏳ Needs input</span>
+          <span className="text-xs text-amber-200/80 truncate flex-1" title={status.waitingMessage}>
+            {status.waitingMessage || "Claude is blocked waiting for input"}
+          </span>
+          <button
+            onClick={handleInterrupt}
+            className="text-xs text-amber-300 hover:text-amber-200 border border-amber-400/40 hover:border-amber-400/60 rounded px-2 py-1 transition-colors shrink-0"
+          >
+            Interrupt
+          </button>
+        </div>
+      )}
 
       {/* Stats row */}
       <div className="grid grid-cols-3 gap-3">
@@ -224,6 +268,7 @@ export function SessionDetail({ session, onRefresh }: { session: string; onRefre
           )}
           <TabButton active={tab === "queue"} label="Queue" count={queue.length} onClick={() => setTab("queue")} />
           <TabButton active={tab === "responses"} label="Responses" count={responses.length} onClick={() => setTab("responses")} />
+          <TabButton active={tab === "history"} label="History" onClick={() => setTab("history")} />
           {tab === "queue" && queue.length > 0 && (
             <button onClick={handleClearQueue} className="ml-auto text-xs text-red-400/70 hover:text-red-300 border border-red-400/20 hover:border-red-400/40 rounded px-2 py-0.5 transition-colors">
               Clear Queue
@@ -247,7 +292,7 @@ export function SessionDetail({ session, onRefresh }: { session: string; onRefre
             ) : (
               <Card>
                 {queue.map((item) => (
-                  <ExpandableQueueItem key={item.id} item={item} />
+                  <ExpandableQueueItem key={item.id} item={item} onCancel={handleCancelQueueItem} />
                 ))}
               </Card>
             )
@@ -267,6 +312,8 @@ export function SessionDetail({ session, onRefresh }: { session: string; onRefre
               </Card>
             )
           )}
+
+          {tab === "history" && <HistoryView session={session} />}
         </div>
       </div>
 

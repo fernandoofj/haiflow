@@ -10,6 +10,7 @@
   "scripts": {
     "dev": "bun --hot src/index.ts",
     "start": "bun run src/index.ts",
+    "github": "bun run src/github-bot.ts",
     "postinstall": "bash bin/postinstall.sh",
     "setup": "bun run bin/haiflow.ts setup",
     "deps": "bash bin/check-deps.sh",
@@ -22,6 +23,7 @@
     "hooks",
     "README.md",
     "API.md",
+    "SECURITY.md",
     "LICENSE",
     "CLAUDE.md",
     ".env.example"

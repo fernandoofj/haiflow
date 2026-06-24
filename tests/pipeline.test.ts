@@ -66,7 +66,7 @@ beforeAll(async () => {
     stderr: "ignore",
   });
 
-  for (let i = 0; i < 30; i++) {
+  for (let i = 0; i < 150; i++) {
     try {
       const res = await fetch(`${BASE}/health`);
       if (res.ok) return;
@@ -466,6 +466,27 @@ describe("pipeline webhooks", () => {
       expect(received.message).toBe("webhook payload");
       expect(received.sourceSession).toBe("test-agent");
       expect(received.publishedAt).toBeDefined();
+
+      // The event must finalize to "delivered" once the webhook resolves.
+      // Regression guard: it used to stay "published" because finalizeEvent ran
+      // while the delivery was still "pending" and was never re-run on success,
+      // so the event lingered in the unprocessed set and was re-delivered on the
+      // next restart. status "delivered" is exactly the proof the fix works:
+      // finalizeEvent only removes an event from the unprocessed/replay set when
+      // its status leaves "published". This whole suite requires Redis (see the
+      // GET /pipeline test asserting redis === true), so assert unconditionally —
+      // a vacuous skip without Redis would make a green run meaningless.
+      const { data: pipeChk } = await api("/pipeline");
+      expect(pipeChk.redis).toBe(true);
+      const { data: ev } = await api("/events?limit=20");
+      const evt = ev.events.find(
+        (e: any) => e.topic === "wh.test" && e.message === "webhook payload"
+      );
+      expect(evt?.status).toBe("delivered");
+      const delivery = evt?.deliveries?.find(
+        (d: any) => d.subscriber === "webhook:http://localhost:19876/hook"
+      );
+      expect(delivery?.status).toBe("delivered");
     } finally {
       webhookServer.stop();
     }
@@ -518,7 +539,9 @@ describe("pipeline webhooks", () => {
       routes: {
         "/hook": {
           POST: async (req) => {
-            receivedHeaders = Object.fromEntries(req.headers.entries());
+            req.headers.forEach((value, key) => {
+              receivedHeaders[key] = value;
+            });
             return Response.json({ ok: true });
           },
         },

@@ -1,4 +1,5 @@
 import { RedisClient } from "bun";
+import { prefixedId } from "./utils";
 
 // --- Types ---
 
@@ -32,49 +33,75 @@ export interface DeliveryRecord {
 export interface WebhookRetry extends DeliveryRecord {
   topic: string;
   message: string;
+  sourceSession: string;
+  taskId: string;
+}
+
+// Exponential backoff schedule for a failed webhook delivery. `attempts` is the
+// delivery's count BEFORE this attempt. Returns null to give up (after 5 tries),
+// otherwise the delay and absolute next-retry time. Doubling: 60s, 120s, 240s, 480s.
+export function nextRetrySchedule(attempts: number, nowMs: number): { delayMs: number; nextRetryAt: string } | null {
+  const next = attempts + 1;
+  if (next >= 5) return null;
+  const delayMs = 60_000 * Math.pow(2, next - 1);
+  return { delayMs, nextRetryAt: new Date(nowMs + delayMs).toISOString() };
 }
 
 const EVENT_TTL = 7 * 86_400; // 7 days in seconds
 const MAX_EVENTS = 1000;
 const CONNECT_TIMEOUT_MS = 3000;
 
+function logRedis(level: "info" | "warn" | "error", event: string, data?: Record<string, unknown>) {
+  const entry = JSON.stringify({ ts: new Date().toISOString(), level, event, ...data });
+  if (level === "error") console.error(entry);
+  else console.log(entry);
+}
+
 // --- EventBus ---
 
 export class EventBus {
   private redis: RedisClient;
-  // false when Redis is unreachable. Methods short-circuit to safe defaults
-  // so the rest of the server (HTTP API, sessions, queues) keeps working.
-  // Pipeline events become fire-and-forget — no persistence, no retry.
-  public readonly connected: boolean;
 
-  private constructor(redisUrl: string, connected: boolean) {
+  // Live connection state, delegated to the auto-reconnecting client rather than
+  // a one-shot boot probe. When false, methods short-circuit to safe defaults so
+  // the rest of the server (HTTP API, sessions, queues) keeps working and
+  // pipeline events become fire-and-forget. Because it tracks the real client,
+  // persistence / retry / replay-protection self-heal once Redis comes back,
+  // instead of staying disabled until a full restart.
+  get connected(): boolean {
+    return this.redis.connected;
+  }
+
+  private constructor(redisUrl: string) {
     this.redis = new RedisClient(redisUrl);
-    this.connected = connected;
+    this.redis.onconnect = () => logRedis("info", "redis_connected", { url: redisUrl });
+    this.redis.onclose = (err) =>
+      logRedis("warn", "redis_disconnected", { url: redisUrl, error: err?.message });
   }
 
   static async create(redisUrl: string): Promise<EventBus> {
-    const probe = new RedisClient(redisUrl);
+    const bus = new EventBus(redisUrl);
+    // Probe the real client so `connected` reflects reality at boot, but never
+    // block longer than CONNECT_TIMEOUT_MS. The .catch stops a slow rejection
+    // from becoming an unhandled rejection after the timeout wins the race;
+    // autoReconnect will keep trying in the background regardless.
+    const connect = bus.redis.connect().catch(() => {});
     try {
       await Promise.race([
-        probe.connect(),
+        connect,
         new Promise<never>((_, reject) =>
           setTimeout(() => reject(new Error("redis connect timeout")), CONNECT_TIMEOUT_MS)
         ),
       ]);
-      probe.close();
-      return new EventBus(redisUrl, true);
+      if (!bus.redis.connected) throw new Error("redis not connected");
     } catch (err) {
-      probe.close();
-      console.error(JSON.stringify({
-        ts: new Date().toISOString(),
-        level: "warn",
-        event: "redis_unavailable",
+      logRedis("warn", "redis_unavailable", {
         url: redisUrl,
         error: err instanceof Error ? err.message : String(err),
-        note: "Pipeline events fall back to direct dispatch — no persistence or retry.",
-      }));
-      return new EventBus(redisUrl, false);
+        note: "Pipeline events fall back to direct dispatch (no persistence or retry) until Redis is reachable.",
+      });
     }
+    return bus;
   }
 
   /** Record a new event. Returns the event ID. */
@@ -85,7 +112,7 @@ export class EventBus {
     taskId: string;
     chain?: string[];
   }): Promise<string> {
-    const id = `evt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const id = prefixedId("evt");
     if (!this.connected) return id;
 
     const record: EventRecord = {
@@ -240,7 +267,8 @@ export class EventBus {
     const deliveries: DeliveryRecord[] = [];
     if (Array.isArray(raw)) {
       for (let i = 1; i < raw.length; i += 2) {
-        deliveries.push(JSON.parse(raw[i]));
+        const value = (raw as unknown[])[i];
+        if (typeof value === "string") deliveries.push(JSON.parse(value));
       }
     } else if (typeof raw === "object") {
       for (const value of Object.values(raw as Record<string, string>)) {
@@ -262,6 +290,7 @@ export class EventBus {
     const retries: WebhookRetry[] = [];
     for (const member of members) {
       const [eventId, subscriber] = member.split("|");
+      if (!eventId || !subscriber) continue;
       const fields = await this.redis.hmget(`haiflow:deliveries:${eventId}`, [subscriber]);
       const deliveryRaw = fields?.[0];
       if (!deliveryRaw) continue;
@@ -277,6 +306,8 @@ export class EventBus {
         ...delivery,
         topic: event.topic,
         message: event.message,
+        sourceSession: event.sourceSession,
+        taskId: event.taskId,
       });
     }
     return retries;
@@ -337,6 +368,26 @@ export class EventBus {
     return pruned;
   }
 
+  /**
+   * Atomically claim a one-time nonce. "fresh" = newly seen (proceed),
+   * "duplicate" = already recorded (a replay), "unavailable" = Redis couldn't be
+   * reached so the claim could not be made. The caller decides how to treat
+   * "unavailable" (the ingest gateway fails closed).
+   */
+  async markNonce(key: string, ttlSec: number): Promise<"fresh" | "duplicate" | "unavailable"> {
+    // Return a distinct "unavailable" when Redis can't be reached (at the start
+    // OR mid-call) instead of silently proceeding. The caller (ingest gateway)
+    // fails closed on "unavailable", which closes a TOCTOU where Redis drops
+    // between a separate liveness probe and this atomic claim.
+    if (!this.connected) return "unavailable";
+    try {
+      const res = await this.redis.send("SET", [`haiflow:nonce:${key}`, "1", "NX", "EX", String(Math.max(1, ttlSec))]);
+      return res === "OK" ? "fresh" : "duplicate";
+    } catch {
+      return "unavailable";
+    }
+  }
+
   /** Flush all haiflow keys (for testing). */
   async flush(): Promise<void> {
     if (!this.connected) return;
@@ -348,9 +399,8 @@ export class EventBus {
     }
   }
 
-  /** Close the Redis connection. */
+  /** Close the Redis connection (and stop auto-reconnect). */
   close() {
-    if (!this.connected) return;
-    this.redis.close();
+    try { this.redis.close(); } catch {}
   }
 }

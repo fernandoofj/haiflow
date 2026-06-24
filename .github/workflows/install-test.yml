@@ -8,7 +8,9 @@ on:
       - "src/**"
       - "hooks/**"
       - "package.json"
-      - "tests/install/**"
+      - "bun.lock"
+      - "tsconfig.json"
+      - "tests/**"
       - ".github/workflows/install-test.yml"
   push:
     branches: [main]
@@ -33,3 +35,33 @@ jobs:
 
       - name: Run E2E with Redis unavailable (fallback path)
         run: docker run --rm -e SKIP_REDIS=1 haiflow-install-test
+
+  unit-test:
+    name: typecheck + bun test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install
+      - name: Typecheck
+        run: bunx tsc --noEmit
+      # No tmux/claude on the runner on purpose: /session/start then fails fast
+      # (409, which the cwd tests tolerate) instead of hanging, and the
+      # live-Claude integration tests self-skip (Bun.which("claude") is null).
+      # Generous per-test timeout: the first server spawn bundles the dashboard
+      # cold, which can exceed the 5s default on a CI runner.
+      - name: Run test suite
+        run: bun test --timeout 30000
+        env:
+          REDIS_URL: redis://localhost:6379

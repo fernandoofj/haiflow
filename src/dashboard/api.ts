@@ -56,6 +56,16 @@ export async function clearQueue(session: string) {
   return res.json();
 }
 
+export async function cancelQueueItem(session: string, id: string) {
+  const res = await apiFetch(`/queue/${encodeURIComponent(id)}?session=${session}`, { method: "DELETE" });
+  return { status: res.status, data: await res.json() };
+}
+
+export async function cancelTask(session: string, id: string) {
+  const res = await apiFetch(`/tasks/${encodeURIComponent(id)}/cancel?session=${session}`, { method: "POST" });
+  return { status: res.status, data: await res.json() };
+}
+
 export async function getResponses(session: string) {
   const res = await apiFetch(`/responses?session=${session}`);
   return res.json();
@@ -95,12 +105,35 @@ export async function stopSession(session: string) {
   return { status: res.status, data: await res.json() };
 }
 
+export async function interruptSession(session: string, mode: "escape" | "ctrl-c" = "escape", prompt?: string) {
+  const res = await apiFetch("/interrupt", {
+    method: "POST",
+    body: JSON.stringify({ session, mode, prompt }),
+  });
+  return { status: res.status, data: await res.json() };
+}
+
 export async function removeSession(session: string) {
   const res = await apiFetch("/session/remove", {
     method: "POST",
     body: JSON.stringify({ session }),
   });
   return { status: res.status, data: await res.json() };
+}
+
+export async function getTasks(session: string, limit = 30) {
+  const res = await apiFetch(`/tasks?session=${session}&limit=${limit}`);
+  return res.json();
+}
+
+export async function getTask(session: string, id: string) {
+  const res = await apiFetch(`/tasks/${id}?session=${session}`);
+  return { status: res.status, data: await res.json() };
+}
+
+export async function getUsageWindow(session?: string) {
+  const res = await apiFetch(`/usage/window${session ? `?session=${session}` : ""}`);
+  return res.json();
 }
 
 export async function getPipeline() {

@@ -1,5 +1,26 @@
 import { test, expect, beforeEach, afterEach, describe } from "bun:test";
-import { EventBus } from "../src/events";
+import { EventBus, nextRetrySchedule } from "../src/events";
+
+describe("nextRetrySchedule (webhook retry backoff)", () => {
+  const NOW = 1_000_000_000_000;
+
+  test("doubles the delay each attempt: 60s, 120s, 240s, 480s", () => {
+    expect(nextRetrySchedule(0, NOW)?.delayMs).toBe(60_000);
+    expect(nextRetrySchedule(1, NOW)?.delayMs).toBe(120_000);
+    expect(nextRetrySchedule(2, NOW)?.delayMs).toBe(240_000);
+    expect(nextRetrySchedule(3, NOW)?.delayMs).toBe(480_000);
+  });
+
+  test("nextRetryAt is now + delay", () => {
+    const s = nextRetrySchedule(1, NOW);
+    expect(s?.nextRetryAt).toBe(new Date(NOW + 120_000).toISOString());
+  });
+
+  test("gives up (null) once 5 attempts are reached", () => {
+    expect(nextRetrySchedule(4, NOW)).toBeNull();
+    expect(nextRetrySchedule(5, NOW)).toBeNull();
+  });
+});
 
 const REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6379";
 
@@ -15,7 +36,41 @@ afterEach(async () => {
   bus.close();
 });
 
+describe("EventBus no-Redis fallback", () => {
+  test("degrades safely when Redis is unreachable", async () => {
+    // Port 1 is never a Redis server, so the client cannot connect.
+    const offline = await EventBus.create("redis://127.0.0.1:1");
+    try {
+      // The getter delegates to the live client, so it reports the real state.
+      expect(offline.connected).toBe(false);
+
+      // recordEvent still returns a usable evt_ id so caller code is unaffected,
+      // but nothing is persisted.
+      const id = await offline.recordEvent({
+        topic: "t", message: "m", sourceSession: "s", taskId: "task_1",
+      });
+      expect(id).toStartWith("evt_");
+      expect(await offline.getRecentEvents()).toEqual([]);
+      expect(await offline.getUnprocessedEvents()).toEqual([]);
+
+      // markNonce reports "unavailable" (not a silent "fresh") when there is no
+      // store to dedupe against, so callers can fail closed instead of proceeding.
+      expect(await offline.markNonce("nonce-1", 60)).toBe("unavailable");
+    } finally {
+      offline.close();
+    }
+  });
+});
+
 describe("EventBus", () => {
+  // --- markNonce (replay nonce) ---
+
+  test("markNonce: fresh once, then duplicate", async () => {
+    const key = `t-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    expect(await bus.markNonce(key, 60)).toBe("fresh");
+    expect(await bus.markNonce(key, 60)).toBe("duplicate");
+  });
+
   // --- recordEvent ---
 
   test("recordEvent returns an event ID", async () => {
@@ -39,13 +94,13 @@ describe("EventBus", () => {
 
     const events = await bus.getRecentEvents();
     expect(events).toHaveLength(1);
-    expect(events[0].topic).toBe("test.done");
-    expect(events[0].message).toBe("result");
-    expect(events[0].sourceSession).toBe("agent-1");
-    expect(events[0].taskId).toBe("task_123");
-    expect(events[0].chain).toEqual(["agent-0"]);
-    expect(events[0].status).toBe("published");
-    expect(events[0].publishedAt).toBeTruthy();
+    expect(events[0]!.topic).toBe("test.done");
+    expect(events[0]!.message).toBe("result");
+    expect(events[0]!.sourceSession).toBe("agent-1");
+    expect(events[0]!.taskId).toBe("task_123");
+    expect(events[0]!.chain).toEqual(["agent-0"]);
+    expect(events[0]!.status).toBe("published");
+    expect(events[0]!.publishedAt).toBeTruthy();
   });
 
   test("recordEvent defaults chain to empty array", async () => {
@@ -57,7 +112,7 @@ describe("EventBus", () => {
     });
 
     const events = await bus.getRecentEvents();
-    expect(events[0].chain).toEqual([]);
+    expect(events[0]!.chain).toEqual([]);
   });
 
   // --- getRecentEvents ---
@@ -67,8 +122,8 @@ describe("EventBus", () => {
     await bus.recordEvent({ topic: "b", message: "second", sourceSession: "s", taskId: "t2" });
 
     const events = await bus.getRecentEvents();
-    expect(events[0].topic).toBe("b");
-    expect(events[1].topic).toBe("a");
+    expect(events[0]!.topic).toBe("b");
+    expect(events[1]!.topic).toBe("a");
   });
 
   test("getRecentEvents respects limit", async () => {
@@ -88,12 +143,12 @@ describe("EventBus", () => {
 
     const deliveries = await bus.getDeliveries(eventId);
     expect(deliveries).toHaveLength(1);
-    expect(deliveries[0].eventId).toBe(eventId);
-    expect(deliveries[0].subscriber).toBe("worker");
-    expect(deliveries[0].type).toBe("session");
-    expect(deliveries[0].status).toBe("queued");
-    expect(deliveries[0].attempts).toBe(1);
-    expect(deliveries[0].createdAt).toBeTruthy();
+    expect(deliveries[0]!.eventId).toBe(eventId);
+    expect(deliveries[0]!.subscriber).toBe("worker");
+    expect(deliveries[0]!.type).toBe("session");
+    expect(deliveries[0]!.status).toBe("queued");
+    expect(deliveries[0]!.attempts).toBe(1);
+    expect(deliveries[0]!.createdAt).toBeTruthy();
   });
 
   test("recordDelivery sets deliveredAt for delivered status", async () => {
@@ -101,7 +156,7 @@ describe("EventBus", () => {
     await bus.recordDelivery(eventId, "worker", "session", "delivered");
 
     const deliveries = await bus.getDeliveries(eventId);
-    expect(deliveries[0].deliveredAt).toBeTruthy();
+    expect(deliveries[0]!.deliveredAt).toBeTruthy();
   });
 
   test("recordDelivery does not set deliveredAt for pending status", async () => {
@@ -109,8 +164,8 @@ describe("EventBus", () => {
     await bus.recordDelivery(eventId, "webhook:http://example.com", "webhook", "pending");
 
     const deliveries = await bus.getDeliveries(eventId);
-    expect(deliveries[0].deliveredAt).toBeNull();
-    expect(deliveries[0].attempts).toBe(0);
+    expect(deliveries[0]!.deliveredAt).toBeNull();
+    expect(deliveries[0]!.attempts).toBe(0);
   });
 
   // --- updateDelivery ---
@@ -122,9 +177,9 @@ describe("EventBus", () => {
     await bus.updateDelivery(eventId, "webhook:http://x.com", { status: "delivered" });
 
     const deliveries = await bus.getDeliveries(eventId);
-    expect(deliveries[0].status).toBe("delivered");
-    expect(deliveries[0].attempts).toBe(1);
-    expect(deliveries[0].deliveredAt).toBeTruthy();
+    expect(deliveries[0]!.status).toBe("delivered");
+    expect(deliveries[0]!.attempts).toBe(1);
+    expect(deliveries[0]!.deliveredAt).toBeTruthy();
   });
 
   test("updateDelivery stores error and retry time", async () => {
@@ -139,9 +194,9 @@ describe("EventBus", () => {
     });
 
     const deliveries = await bus.getDeliveries(eventId);
-    expect(deliveries[0].status).toBe("failed");
-    expect(deliveries[0].lastError).toBe("connection refused");
-    expect(deliveries[0].nextRetryAt).toBe(retryAt);
+    expect(deliveries[0]!.status).toBe("failed");
+    expect(deliveries[0]!.lastError).toBe("connection refused");
+    expect(deliveries[0]!.nextRetryAt).toBe(retryAt);
   });
 
   // --- finalizeEvent ---
@@ -155,7 +210,7 @@ describe("EventBus", () => {
     await bus.finalizeEvent(eventId);
 
     const events = await bus.getRecentEvents();
-    expect(events[0].status).toBe("delivered");
+    expect(events[0]!.status).toBe("delivered");
   });
 
   test("finalizeEvent sets partial when some failed", async () => {
@@ -167,7 +222,7 @@ describe("EventBus", () => {
     await bus.finalizeEvent(eventId);
 
     const events = await bus.getRecentEvents();
-    expect(events[0].status).toBe("partial");
+    expect(events[0]!.status).toBe("partial");
   });
 
   test("finalizeEvent sets failed when all failed", async () => {
@@ -180,7 +235,7 @@ describe("EventBus", () => {
     await bus.finalizeEvent(eventId);
 
     const events = await bus.getRecentEvents();
-    expect(events[0].status).toBe("failed");
+    expect(events[0]!.status).toBe("failed");
   });
 
   test("finalizeEvent stays published when deliveries pending", async () => {
@@ -190,7 +245,7 @@ describe("EventBus", () => {
     await bus.finalizeEvent(eventId);
 
     const events = await bus.getRecentEvents();
-    expect(events[0].status).toBe("published");
+    expect(events[0]!.status).toBe("published");
   });
 
   test("finalizeEvent sets delivered when no deliveries", async () => {
@@ -199,7 +254,7 @@ describe("EventBus", () => {
     await bus.finalizeEvent(eventId);
 
     const events = await bus.getRecentEvents();
-    expect(events[0].status).toBe("delivered");
+    expect(events[0]!.status).toBe("delivered");
   });
 
   // --- getPendingWebhookRetries ---
@@ -217,8 +272,8 @@ describe("EventBus", () => {
 
     const retries = await bus.getPendingWebhookRetries();
     expect(retries).toHaveLength(1);
-    expect(retries[0].topic).toBe("calc.done");
-    expect(retries[0].message).toBe("4");
+    expect(retries[0]!.topic).toBe("calc.done");
+    expect(retries[0]!.message).toBe("4");
   });
 
   test("getPendingWebhookRetries excludes future retries", async () => {
@@ -263,7 +318,7 @@ describe("EventBus", () => {
 
     const unprocessed = await bus.getUnprocessedEvents();
     expect(unprocessed).toHaveLength(1);
-    expect(unprocessed[0].topic).toBe("a");
+    expect(unprocessed[0]!.topic).toBe("a");
   });
 
   test("getUnprocessedEvents returns oldest first", async () => {
@@ -271,8 +326,8 @@ describe("EventBus", () => {
     await bus.recordEvent({ topic: "b", message: "2", sourceSession: "s", taskId: "t2" });
 
     const unprocessed = await bus.getUnprocessedEvents();
-    expect(unprocessed[0].topic).toBe("a");
-    expect(unprocessed[1].topic).toBe("b");
+    expect(unprocessed[0]!.topic).toBe("a");
+    expect(unprocessed[1]!.topic).toBe("b");
   });
 
   // --- prune ---
