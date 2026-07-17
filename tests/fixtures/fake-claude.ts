@@ -54,6 +54,22 @@ function drawPrompt(): void {
   process.stdout.write("\n❯ \n");
 }
 
+function drawWorkspaceTrustPrompt(): void {
+  process.stdout.write(`
+────────────────────────────────────────────────────────────────────────────────
+ Accessing workspace:
+
+ ${process.cwd()}
+
+ Quick safety check: Is this a project you created or one you trust?
+
+ ❯ 1. Yes, I trust this folder
+   2. No, exit
+
+ Enter to confirm · Esc to cancel
+`);
+}
+
 // Announce our session id until haiflow links it. The SessionStart hook may run
 // before haiflow has written the session's state dir (a boot race), so a single
 // post can no-op — retry until the hook echoes back a linked session. The 120 ×
@@ -176,12 +192,18 @@ async function handleSubmit(raw: string): Promise<void> {
 }
 
 function main(): void {
-  drawPrompt();
   // Test hook: a session started in a cwd ending in "nolink" simulates Claude
   // booting with its hooks NOT wired — it never fires SessionStart, so haiflow
   // never links a session id. Lets a test exercise the unlinked-start failure.
   const noLink = process.cwd().endsWith("nolink") || process.env.FAKE_CLAUDE_NO_LINK === "1";
-  if (!noLink) void announceUntilLinked();
+  let waitingForTrust = process.cwd().endsWith("trust") || process.env.FAKE_CLAUDE_WORKSPACE_TRUST === "1";
+
+  if (waitingForTrust) {
+    drawWorkspaceTrustPrompt();
+  } else {
+    drawPrompt();
+    if (!noLink) void announceUntilLinked();
+  }
 
   process.stdin.setRawMode?.(true);
   process.stdin.resume();
@@ -191,6 +213,14 @@ function main(): void {
   let bytes: number[] = [];
   process.stdin.on("data", (chunk: Buffer) => {
     for (const byte of chunk) {
+      if (waitingForTrust) {
+        if (byte === 0x0d) {
+          waitingForTrust = false;
+          drawPrompt();
+          if (!noLink) void announceUntilLinked();
+        }
+        continue;
+      }
       if (byte === 0x0d) {
         const payload = Buffer.from(bytes).toString("utf8");
         bytes = [];

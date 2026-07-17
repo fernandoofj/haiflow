@@ -88,6 +88,8 @@ function resolveStartCwd(
 }
 const ENABLE_GUARDRAILS = (process.env.HAIFLOW_GUARDRAILS ?? "true").toLowerCase() !== "false";
 const GUARDRAIL_SKILL_NAME = "haiflow-guardrails";
+const AUTO_ACCEPT_WORKSPACE_TRUST =
+  (process.env.HAIFLOW_AUTO_ACCEPT_WORKSPACE_TRUST ?? "false").toLowerCase() === "true";
 // How long /session/start waits for the SessionStart hook to link a Claude
 // session id (and the TUI to become interactive) before giving up.
 const START_READY_TIMEOUT_MS = Number(process.env.HAIFLOW_START_READY_TIMEOUT_MS ?? 15_000);
@@ -1082,10 +1084,20 @@ async function waitForGuardrailComplete(session: string, maxWait = 30_000): Prom
 }
 
 async function startClaudeSession(session: string, cwd: string): Promise<{ success: boolean; error?: string; ready?: boolean }> {
+  const target = tmuxName(session);
   if (isTmuxRunning(session)) {
+    const pane = capturePane(target);
+    if (isWorkspaceTrustPrompt(pane)) {
+      if (!AUTO_ACCEPT_WORKSPACE_TRUST) return workspaceTrustRequired(session, cwd);
+      Bun.spawnSync(["tmux", "send-keys", "-t", target, "Enter"]);
+      log("warn", "session_start_workspace_trust_auto_accepted", { session, cwd, reused: true });
+      setSessionId(session, null);
+      writeState(session, { status: "idle", since: new Date().toISOString(), cwd });
+    } else {
     log("info", "session_reused", { session });
     writeState(session, { status: "idle", since: new Date().toISOString(), cwd });
     return { success: true, ready: true };
+    }
   }
 
   // Fail fast (and clearly) if the Claude CLI isn't installed. Otherwise tmux
@@ -1096,27 +1108,41 @@ async function startClaudeSession(session: string, cwd: string): Promise<{ succe
     return { success: false, error: "claude CLI not found on PATH" };
   }
 
-  const result = Bun.spawnSync([
-    "tmux", "new-session", "-d", "-s", tmuxName(session), "-c", cwd,
-    "-e", `HAIFLOW=1`,
-    "-e", `HAIFLOW_PORT=${PORT}`,
-    "claude", "--permission-mode", "auto",
-  ]);
+  if (!isTmuxRunning(session)) {
+    const result = Bun.spawnSync([
+      "tmux", "new-session", "-d", "-s", target, "-c", cwd,
+      "-e", `HAIFLOW=1`,
+      "-e", `HAIFLOW_PORT=${PORT}`,
+      "claude", "--permission-mode", "auto",
+    ]);
 
-  if (result.exitCode !== 0) {
-    log("error", "session_start_failed", { session, error: result.stderr.toString() });
-    return { success: false, error: result.stderr.toString() };
+    if (result.exitCode !== 0) {
+      log("error", "session_start_failed", { session, error: result.stderr.toString() });
+      return { success: false, error: result.stderr.toString() };
+    }
+
+    setSessionId(session, null);
+    writeState(session, { status: "idle", since: new Date().toISOString(), cwd });
   }
-
-  setSessionId(session, null);
-  writeState(session, { status: "idle", since: new Date().toISOString(), cwd });
 
   // Block until Claude's TUI is actually interactive. The session-start hook
   // fires early in boot before the input box is mounted — hook-only checks
   // aren't enough, so we also require the prompt line to appear in the pane.
-  const target = tmuxName(session);
   const start = Date.now();
+  let trustAccepted = false;
   while (Date.now() - start < START_READY_TIMEOUT_MS) {
+    const pane = capturePane(target);
+    if (isWorkspaceTrustPrompt(pane)) {
+      if (!AUTO_ACCEPT_WORKSPACE_TRUST) {
+        return workspaceTrustRequired(session, cwd);
+      }
+      if (!trustAccepted) {
+        Bun.spawnSync(["tmux", "send-keys", "-t", target, "Enter"]);
+        trustAccepted = true;
+        log("warn", "session_start_workspace_trust_auto_accepted", { session, cwd });
+      }
+    }
+
     if (getSessionId(session) && isTuiInteractive(target)) {
       log("info", "session_started", { session, cwd, readyMs: Date.now() - start });
       injectGuardrailCommand(session);
@@ -1146,11 +1172,30 @@ async function startClaudeSession(session: string, cwd: string): Promise<{ succe
   return { success: true, ready: false };
 }
 
-function isTuiInteractive(target: string): boolean {
+function workspaceTrustRequired(session: string, cwd: string): { success: false; error: string } {
+  log("error", "session_start_workspace_trust_required", { session, cwd });
+  return {
+    success: false,
+    error: "Claude Code is waiting for workspace trust confirmation. Attach with `tmux attach -t "
+      + tmuxName(session)
+      + "` and accept the folder once, or set HAIFLOW_AUTO_ACCEPT_WORKSPACE_TRUST=true for trusted automation.",
+  };
+}
+
+function capturePane(target: string): string {
   const pane = Bun.spawnSync(["tmux", "capture-pane", "-t", target, "-p"]);
-  if (pane.exitCode !== 0) return false;
+  if (pane.exitCode !== 0) return "";
+  return pane.stdout.toString();
+}
+
+function isWorkspaceTrustPrompt(pane: string): boolean {
+  return pane.includes("Quick safety check")
+    && pane.includes("Yes, I trust this folder");
+}
+
+function isTuiInteractive(target: string): boolean {
   // Claude's input box renders a `❯ ` prompt marker once the TUI is mounted.
-  return pane.stdout.toString().includes("❯");
+  return capturePane(target).includes("❯");
 }
 
 function stopClaudeSession(session: string): { success: boolean; error?: string } {

@@ -21,6 +21,8 @@ Returns `{ "started": true, "session": "worker", "tmux": "worker", "cwd": "...",
 
 If the session never links a Claude session id within `HAIFLOW_START_READY_TIMEOUT_MS` (default 15000) — almost always because the Claude hooks are not wired — the dead pane is torn down and the call returns `409` with `{ "error": "...hooks are likely not wired (run `haiflow setup`)", "session": "..." }` rather than reporting a healthy start that would silently drop every response. Run `haiflow setup` / `haiflow doctor` to wire and verify hooks.
 
+If Claude Code is waiting on its workspace trust prompt, `/session/start` also returns `409`, but with a workspace-trust-specific action. Attach to the tmux session and accept the folder once, or set `HAIFLOW_AUTO_ACCEPT_WORKSPACE_TRUST=true` for trusted automation. Only enable auto-accept when `HAIFLOW_CWD` is pinned to a directory you control.
+
 ## `POST /session/stop`
 
 Kill a Claude tmux session.

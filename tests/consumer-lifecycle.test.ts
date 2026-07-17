@@ -25,7 +25,14 @@ const SESSION = "consumer-test";
 // Every session name this file may start, so setup/teardown can kill leftovers
 // from an aborted prior run (otherwise a stale tmux session is "reused" and the
 // next run sees the wrong state).
-const ALL_SESSIONS = [SESSION, "consumer-fof", "consumer-both", "consumer-nolink", "consumer-nocwd-fof"];
+const ALL_SESSIONS = [
+  SESSION,
+  "consumer-fof",
+  "consumer-both",
+  "consumer-nolink",
+  "consumer-trust",
+  "consumer-nocwd-fof",
+];
 const TIMEOUT = 30_000;
 
 const FAKE_SRC = join(import.meta.dir, "fixtures", "fake-claude.ts");
@@ -546,6 +553,28 @@ describe("consumer error paths", () => {
 
       Bun.spawnSync(["tmux", "kill-session", "-t", nolinkSession]);
       if (existsSync(nolinkDir)) rmSync(nolinkDir, { recursive: true, force: true });
+    },
+    TIMEOUT
+  );
+
+  test.skipIf(!HAS_TMUX)(
+    "a session waiting for workspace trust fails with a clear action",
+    async () => {
+      const trustDir = "/tmp/haiflow-consumer-trust";
+      mkdirSync(trustDir, { recursive: true });
+      const trustSession = "consumer-trust";
+      Bun.spawnSync(["tmux", "kill-session", "-t", trustSession]);
+
+      const start = await api("/session/start", "POST", { session: trustSession, cwd: trustDir });
+      expect(start.status).toBe(409);
+      expect(start.data.session).toBe(trustSession);
+      expect(String(start.data.error).toLowerCase()).toContain("workspace trust");
+      expect(String(start.data.error)).toContain("HAIFLOW_AUTO_ACCEPT_WORKSPACE_TRUST");
+
+      expect(Bun.spawnSync(["tmux", "has-session", "-t", trustSession]).exitCode).toBe(0);
+
+      Bun.spawnSync(["tmux", "kill-session", "-t", trustSession]);
+      if (existsSync(trustDir)) rmSync(trustDir, { recursive: true, force: true });
     },
     TIMEOUT
   );
