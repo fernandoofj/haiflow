@@ -1093,10 +1093,12 @@ async function startClaudeSession(session: string, cwd: string): Promise<{ succe
       log("warn", "session_start_workspace_trust_auto_accepted", { session, cwd, reused: true });
       setSessionId(session, null);
       writeState(session, { status: "idle", since: new Date().toISOString(), cwd });
+    } else if (dismissClaudeStartupPrompt(session, target, pane)) {
+      writeState(session, { status: "idle", since: new Date().toISOString(), cwd });
     } else {
-    log("info", "session_reused", { session });
-    writeState(session, { status: "idle", since: new Date().toISOString(), cwd });
-    return { success: true, ready: true };
+      log("info", "session_reused", { session });
+      writeState(session, { status: "idle", since: new Date().toISOString(), cwd });
+      return { success: true, ready: true };
     }
   }
 
@@ -1141,6 +1143,9 @@ async function startClaudeSession(session: string, cwd: string): Promise<{ succe
         trustAccepted = true;
         log("warn", "session_start_workspace_trust_auto_accepted", { session, cwd });
       }
+    } else if (dismissClaudeStartupPrompt(session, target, pane)) {
+      await Bun.sleep(200);
+      continue;
     }
 
     if (getSessionId(session) && isTuiInteractive(target)) {
@@ -1191,6 +1196,30 @@ function capturePane(target: string): string {
 function isWorkspaceTrustPrompt(pane: string): boolean {
   return pane.includes("Quick safety check")
     && pane.includes("Yes, I trust this folder");
+}
+
+function dismissClaudeStartupPrompt(session: string, target: string, pane: string): boolean {
+  const prompt = startupPromptName(pane);
+  if (!prompt) return false;
+  Bun.spawnSync(["tmux", "send-keys", "-t", target, "Escape"]);
+  log("warn", "session_start_onboarding_prompt_dismissed", { session, prompt });
+  return true;
+}
+
+function startupPromptName(pane: string): string | null {
+  if (
+    pane.includes("Claude in Chrome extension detected")
+    && pane.includes("Yes, use my browser")
+  ) {
+    return "chrome_integration";
+  }
+  if (
+    pane.includes("Try the new fullscreen renderer")
+    && pane.includes("Yes, try it")
+  ) {
+    return "fullscreen_renderer";
+  }
+  return null;
 }
 
 function isTuiInteractive(target: string): boolean {

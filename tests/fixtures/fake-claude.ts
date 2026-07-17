@@ -70,6 +70,35 @@ function drawWorkspaceTrustPrompt(): void {
 `);
 }
 
+function drawChromePrompt(): void {
+  process.stdout.write(`
+────────────────────────────────────────────────────────────────────────────────
+  Claude in Chrome extension detected
+
+  Claude will use your Chrome browser by default.
+
+  ❯ 1. Yes, use my browser
+    2. No, keep browser tools off
+
+  Enter to confirm · Esc to keep browser tools off
+`);
+}
+
+function drawFullscreenPrompt(): void {
+  process.stdout.write(`
+────────────────────────────────────────────────────────────────────────────────
+  Try the new fullscreen renderer?
+
+  · Flicker-free output
+  · Mouse support
+
+  ❯ 1. Yes, try it
+    2. Not now
+
+  Enter to confirm · Esc to cancel
+`);
+}
+
 // Announce our session id until haiflow links it. The SessionStart hook may run
 // before haiflow has written the session's state dir (a boot race), so a single
 // post can no-op — retry until the hook echoes back a linked session. The 120 ×
@@ -197,12 +226,25 @@ function main(): void {
   // never links a session id. Lets a test exercise the unlinked-start failure.
   const noLink = process.cwd().endsWith("nolink") || process.env.FAKE_CLAUDE_NO_LINK === "1";
   let waitingForTrust = process.cwd().endsWith("trust") || process.env.FAKE_CLAUDE_WORKSPACE_TRUST === "1";
+  const startupPrompts: string[] = process.cwd().endsWith("onboarding")
+    || process.env.FAKE_CLAUDE_ONBOARDING_PROMPTS === "1"
+    ? ["chrome", "fullscreen"]
+    : [];
+
+  const continueStartup = () => {
+    const next = startupPrompts.shift();
+    if (next === "chrome") drawChromePrompt();
+    else if (next === "fullscreen") drawFullscreenPrompt();
+    else {
+      drawPrompt();
+      if (!noLink) void announceUntilLinked();
+    }
+  };
 
   if (waitingForTrust) {
     drawWorkspaceTrustPrompt();
   } else {
-    drawPrompt();
-    if (!noLink) void announceUntilLinked();
+    continueStartup();
   }
 
   process.stdin.setRawMode?.(true);
@@ -219,6 +261,10 @@ function main(): void {
           drawPrompt();
           if (!noLink) void announceUntilLinked();
         }
+        continue;
+      }
+      if (startupPrompts.length > 0 || chunk.includes(0x1b)) {
+        if (byte === 0x1b) continueStartup();
         continue;
       }
       if (byte === 0x0d) {

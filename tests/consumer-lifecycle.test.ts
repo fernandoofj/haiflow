@@ -31,6 +31,7 @@ const ALL_SESSIONS = [
   "consumer-both",
   "consumer-nolink",
   "consumer-trust",
+  "consumer-onboarding",
   "consumer-nocwd-fof",
 ];
 const TIMEOUT = 30_000;
@@ -575,6 +576,31 @@ describe("consumer error paths", () => {
 
       Bun.spawnSync(["tmux", "kill-session", "-t", trustSession]);
       if (existsSync(trustDir)) rmSync(trustDir, { recursive: true, force: true });
+    },
+    TIMEOUT
+  );
+
+  test.skipIf(!HAS_TMUX)(
+    "dismisses safe Claude Code onboarding prompts during startup",
+    async () => {
+      const onboardingDir = "/tmp/haiflow-consumer-onboarding";
+      mkdirSync(onboardingDir, { recursive: true });
+      const onboardingSession = "consumer-onboarding";
+      Bun.spawnSync(["tmux", "kill-session", "-t", onboardingSession]);
+
+      const start = await api("/session/start", "POST", {
+        session: onboardingSession,
+        cwd: onboardingDir,
+      });
+      expect(start.status).toBe(200);
+      expect(start.data.started).toBe(true);
+
+      const doctor = await api(`/doctor?session=${onboardingSession}`);
+      expect(doctor.status).toBe(200);
+      expect(doctor.data.hooksLinked).toBe(true);
+
+      await api("/session/stop", "POST", { session: onboardingSession });
+      if (existsSync(onboardingDir)) rmSync(onboardingDir, { recursive: true, force: true });
     },
     TIMEOUT
   );
