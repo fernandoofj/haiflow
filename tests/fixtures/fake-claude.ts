@@ -108,6 +108,7 @@ async function handleSubmit(raw: string): Promise<void> {
 
   // Optional control tokens (stripped before echo):
   //   <<sleep:N>>    widen the processing window so a test can observe busy/queued
+  //   <<display>>    emit MessageDisplay hook deltas before the Stop hook
   //   <<transcript>> report via a real transcript (primary path) not the fallback
   let delayMs = DEFAULT_DELAY_MS;
   const sleepTok = payload.match(/<<sleep:(\d+)>>/);
@@ -117,6 +118,8 @@ async function handleSubmit(raw: string): Promise<void> {
   }
   const useTranscript = payload.includes("<<transcript>>");
   if (useTranscript) payload = payload.replace("<<transcript>>", "");
+  const useDisplay = payload.includes("<<display>>");
+  if (useDisplay) payload = payload.replace("<<display>>", "");
 
   if (delayMs > 0) await Bun.sleep(delayMs);
 
@@ -124,6 +127,17 @@ async function handleSubmit(raw: string): Promise<void> {
 
   if (useTranscript) {
     const transcriptReply = `TRANSCRIPT-SOURCED lines=${lineCount}\n<<<PAYLOAD\n${payload}\nPAYLOAD>>>`;
+    if (useDisplay) {
+      await postHook("/hooks/message-display", {
+        session_id: SESSION_ID,
+        hook_event_name: "MessageDisplay",
+        turn_id: `fake-turn-${submitCount}`,
+        message_id: `fake-message-${submitCount}`,
+        index: 0,
+        final: true,
+        delta: transcriptReply,
+      });
+    }
     const transcriptPath = await writeTranscript(payload, transcriptReply);
     await postHook("/hooks/stop", {
       session_id: SESSION_ID,
@@ -134,6 +148,27 @@ async function handleSubmit(raw: string): Promise<void> {
     });
   } else {
     const reply = `FAKE-CLAUDE-REPLY lines=${lineCount}\n<<<PAYLOAD\n${payload}\nPAYLOAD>>>`;
+    if (useDisplay) {
+      const splitAt = Math.max(1, Math.floor(reply.length / 2));
+      await postHook("/hooks/message-display", {
+        session_id: SESSION_ID,
+        hook_event_name: "MessageDisplay",
+        turn_id: `fake-turn-${submitCount}`,
+        message_id: `fake-message-${submitCount}`,
+        index: 0,
+        final: false,
+        delta: reply.slice(0, splitAt),
+      });
+      await postHook("/hooks/message-display", {
+        session_id: SESSION_ID,
+        hook_event_name: "MessageDisplay",
+        turn_id: `fake-turn-${submitCount}`,
+        message_id: `fake-message-${submitCount}`,
+        index: 1,
+        final: true,
+        delta: reply.slice(splitAt),
+      });
+    }
     await postHook("/hooks/stop", { session_id: SESSION_ID, last_assistant_message: reply });
   }
 

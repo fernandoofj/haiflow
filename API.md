@@ -161,7 +161,7 @@ Status codes:
 
 ## `GET /responses/:id/stream`
 
-Stream response status via Server-Sent Events. Opens a persistent connection that sends real-time updates until the task completes — no polling required.
+Stream response status via Server-Sent Events. Opens a persistent connection that sends real-time updates until the task completes — no polling required. When Claude Code emits `MessageDisplay` hook batches, the stream also includes `delta` events. These are display/progress batches, not guaranteed token-by-token model output.
 
 ```bash
 curl -N "http://localhost:3333/responses/task-001/stream?session=worker"
@@ -174,6 +174,7 @@ curl -N "http://localhost:3333/responses/task-001/stream?session=worker"
 
 Events:
 - **`status`**: `{"id": "...", "status": "pending"}` or `{"status": "queued", "position": 2}`
+- **`delta`**: Claude Code `MessageDisplay` batch: `{"taskId": "...", "index": 0, "final": false, "delta": "..."}`
 - **`complete`**: Full response object (same as `GET /responses/:id`)
 - **`error`**: `{"error": "Session is offline"}`
 - **`timeout`**: Sent when the timeout is reached
@@ -188,6 +189,7 @@ es.addEventListener("complete", (e) => {
   es.close();
 });
 es.addEventListener("status", (e) => console.log("Status:", JSON.parse(e.data)));
+es.addEventListener("delta", (e) => process.stdout.write(JSON.parse(e.data).delta));
 es.addEventListener("error", (e) => { console.error(e.data); es.close(); });
 es.addEventListener("timeout", () => { console.log("Timed out"); es.close(); });
 ```

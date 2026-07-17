@@ -384,6 +384,35 @@ describe("consumer lifecycle", () => {
   );
 
   test.skipIf(!HAS_TMUX)(
+    "streams MessageDisplay deltas before the response completes",
+    async () => {
+      await api("/session/start", "POST", { session: SESSION, cwd: "/tmp" });
+
+      const id = "consumer-sse-delta";
+      await api("/trigger", "POST", {
+        prompt: "stream this answer DELTA-MARKER <<display>><<sleep:1000>>",
+        session: SESSION,
+        id,
+      });
+
+      const events = await streamRaw(id, 20);
+      const deltaEvents = events.filter((e) => e.event === "delta");
+      const completeIdx = events.findIndex((e) => e.event === "complete");
+      const firstDeltaIdx = events.findIndex((e) => e.event === "delta");
+
+      expect(deltaEvents).toHaveLength(2);
+      expect(firstDeltaIdx).toBeGreaterThanOrEqual(0);
+      expect(completeIdx).toBeGreaterThan(firstDeltaIdx);
+      expect(deltaEvents.map((e) => e.data.delta).join("")).toContain("DELTA-MARKER");
+      expect(deltaEvents.at(-1)?.data.final).toBe(true);
+      expect(finalResult(events).messages!.join("\n")).toContain("DELTA-MARKER");
+
+      await api("/session/stop", "POST", { session: SESSION });
+    },
+    TIMEOUT
+  );
+
+  test.skipIf(!HAS_TMUX)(
     "polling a response while it's still running returns 202 pending",
     async () => {
       await api("/session/start", "POST", { session: SESSION, cwd: "/tmp" });

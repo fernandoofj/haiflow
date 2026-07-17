@@ -665,6 +665,60 @@ function responseFile(session: string, id: string): string {
   return `${p.responses}/${sanitizeId(id)}.json`;
 }
 
+function displayEventsFile(session: string, id: string): string {
+  const p = sessionPaths(session);
+  return `${p.responses}/${sanitizeId(id)}.display.jsonl`;
+}
+
+interface DisplayDeltaEvent {
+  id: string;
+  session: string;
+  taskId: string;
+  turnId?: string;
+  messageId?: string;
+  index: number;
+  final: boolean;
+  delta: string;
+  created_at: string;
+}
+
+function appendDisplayDelta(session: string, taskId: string, body: Record<string, unknown>): DisplayDeltaEvent | null {
+  const rawDelta = typeof body.delta === "string" ? body.delta : "";
+  const safeDelta = redactOut(rawDelta).text;
+  const event: DisplayDeltaEvent = {
+    id: prefixedId("display"),
+    session,
+    taskId,
+    turnId: typeof body.turn_id === "string" ? body.turn_id : undefined,
+    messageId: typeof body.message_id === "string" ? body.message_id : undefined,
+    index: Number.isFinite(Number(body.index)) ? Number(body.index) : 0,
+    final: body.final === true,
+    delta: safeDelta,
+    created_at: new Date().toISOString(),
+  };
+
+  try {
+    const file = displayEventsFile(session, taskId);
+    writeFileSync(file, `${JSON.stringify(event)}\n`, { flag: "a" });
+    return event;
+  } catch (e) {
+    log("warn", "display_delta_write_failed", { session, taskId, error: String(e) });
+    return null;
+  }
+}
+
+function readDisplayDeltas(session: string, taskId: string, offset = 0): { events: DisplayDeltaEvent[]; offset: number } {
+  const file = displayEventsFile(session, taskId);
+  if (!existsSync(file)) return { events: [], offset };
+  try {
+    const lines = readFileSync(file, "utf-8").split("\n").filter(Boolean);
+    const selected = lines.slice(offset).map((line) => JSON.parse(line) as DisplayDeltaEvent);
+    return { events: selected, offset: lines.length };
+  } catch {
+    return { events: [], offset };
+  }
+}
+
 // Write atomically: write a temp file in the same dir, then rename over the
 // target. rename(2) is atomic on POSIX, so a reader never sees a half-written
 // file and a crash mid-write can't corrupt the existing one. This is what keeps
@@ -1798,8 +1852,13 @@ const server = Bun.serve({
               try {
                 const deadline = Date.now() + timeoutSec * 1000;
                 const interval = 1500;
+                let displayOffset = 0;
 
                 while (Date.now() < deadline) {
+                  const deltas = readDisplayDeltas(session, id, displayOffset);
+                  displayOffset = deltas.offset;
+                  for (const delta of deltas.events) send("delta", delta);
+
                   const f = responseFile(session, id);
                   if (existsSync(f)) {
                     try {
@@ -2026,6 +2085,33 @@ const server = Bun.serve({
         });
 
         return Response.json({ ok: true });
+      },
+    },
+
+    "/hooks/message-display": {
+      POST: async (req) => {
+        const err = requireLocalhost(req);
+        if (err) return err;
+        const body = await readJson(req);
+        if (!body) return Response.json({ error: "Invalid or empty JSON body" }, { status: 400 });
+        const session = findSessionByClaudeId(body.session_id);
+        if (!session) return Response.json({ ok: true });
+
+        const state = readState(session);
+        const taskId = state.currentTaskId;
+        if (!taskId) return Response.json({ ok: true, session });
+
+        const event = appendDisplayDelta(session, taskId, body);
+        if (event) {
+          log("info", "hook_message_display", {
+            session,
+            taskId,
+            index: event.index,
+            final: event.final,
+            bytes: event.delta.length,
+          });
+        }
+        return Response.json({ ok: true, session, taskId });
       },
     },
 

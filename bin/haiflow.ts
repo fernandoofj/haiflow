@@ -87,6 +87,7 @@ async function setup() {
   const hookMap: Record<string, string> = {
     SessionStart: `${HOOKS_DIR}/session-start.sh`,
     UserPromptSubmit: `${HOOKS_DIR}/prompt.sh`,
+    MessageDisplay: `${HOOKS_DIR}/message-display.sh`,
     Stop: `${HOOKS_DIR}/stop.sh`,
     SessionEnd: `${HOOKS_DIR}/session-end.sh`,
     Notification: `${HOOKS_DIR}/notification.sh`,
