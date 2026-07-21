@@ -1388,6 +1388,143 @@ function finishMapRun(run: MapRun, partial: boolean) {
   dispatchOrQueue(run.reduce.session, prompt, { id: reduceTaskId, source: `map:${run.runId}` });
 }
 
+// --- Claude Code account auth (W1.1) ----------------------------------------
+// Lets an operator authenticate (or re-authenticate) THIS container's own
+// Claude Code / Anthropic login through the API, instead of the manual
+// `docker compose exec -it haiflow claude` terminal step (see
+// servicenow-ai-factory's infra/haiflow/README.md). Confirmed empirically
+// (2026-07-21 POC, disposable container, never touched a real account)
+// before building this: `claude auth login` prints its OAuth URL to stdout
+// within ~1-2s even with piped (non-TTY) stdio, then genuinely reads a
+// pasted authorization code from stdin (not just a decorative prompt).
+//
+// One container = one account (see the multi-account design note in
+// AgenticUI's TASKS.md, W1 section) -- this auth flow only ever touches
+// the ONE Claude Code login this container's $HOME holds, never a
+// "session" by name the way /trigger's `session` param does.
+
+interface PendingLogin {
+  proc: Subprocess<"pipe", "pipe", "pipe">;
+  createdAt: number;
+}
+
+// Abandoned logins (operator opened the link, never came back with a code)
+// would otherwise leak a child process forever -- same cleanup spirit as
+// stopClaudeSession for a dead tmux pane, just for this instead.
+const PENDING_LOGIN_TTL_MS = 5 * 60 * 1000;
+const pendingLogins = new Map<string, PendingLogin>();
+
+function reapAbandonedLogins() {
+  const now = Date.now();
+  for (const [id, entry] of pendingLogins) {
+    if (now - entry.createdAt > PENDING_LOGIN_TTL_MS) {
+      entry.proc.kill();
+      pendingLogins.delete(id);
+      log("warn", "auth_login_reaped", { loginId: id });
+    }
+  }
+}
+
+async function startAuthLogin(): Promise<{ loginId: string; url: string } | { error: string }> {
+  reapAbandonedLogins();
+  if (!Bun.which("claude")) {
+    return { error: "claude CLI not found on PATH" };
+  }
+
+  const proc = Bun.spawn(["claude", "auth", "login"], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+  const loginId = prefixedId("login");
+  const reader = proc.stdout.getReader();
+  const decoder = new TextDecoder();
+  let buffered = "";
+  // The URL line prints within ~1-2s in practice (POC-confirmed); 10s gives
+  // real headroom without leaving a caller hanging on a broken CLI.
+  const deadline = Date.now() + 10_000;
+
+  try {
+    while (Date.now() < deadline) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffered += decoder.decode(value, { stream: true });
+      const match = buffered.match(/visit:\s*(\S+)/);
+      const url = match?.[1];
+      if (url) {
+        pendingLogins.set(loginId, { proc, createdAt: Date.now() });
+        log("info", "auth_login_started", { loginId });
+        return { loginId, url };
+      }
+    }
+  } finally {
+    // Only release, never cancel -- once handed off, submitAuthLoginCode
+    // owns proc's lifecycle. Leaving the reader locked would deadlock the
+    // stdin write later (Bun ties stdin/stdout flow control together).
+    reader.releaseLock();
+  }
+
+  proc.kill();
+  log("error", "auth_login_url_not_found", { loginId });
+  return { error: "Did not see an authorization URL from `claude auth login` in time." };
+}
+
+async function submitAuthLoginCode(loginId: string, code: string): Promise<{ success: boolean; message: string }> {
+  const entry = pendingLogins.get(loginId);
+  if (!entry) {
+    return { success: false, message: "No pending login with that id — it may have expired or already been used." };
+  }
+  pendingLogins.delete(loginId);
+
+  // .write() alone can leave the bytes sitting in Bun's internal FileSink
+  // buffer without ever reaching the child's stdin pipe -- .flush() pushes
+  // them through. Deliberately NOT calling .end() (closing the descriptor):
+  // `claude auth login` reads the code via a line-buffered prompt, not EOF,
+  // and closing stdin here hung the child indefinitely in testing (it
+  // never got to react to the pasted line at all) -- the working POC never
+  // closed stdin either, just wrote the line and left the pipe open.
+  entry.proc.stdin.write(`${code}\n`);
+  await entry.proc.stdin.flush();
+
+  // A WRONG code does not exit the process (POC-confirmed: it just prints
+  // "Invalid code..." to stderr and keeps waiting) -- race against a
+  // timeout instead of trusting `exited` to always settle, and kill the
+  // child either way so a bad attempt can't linger as a phantom pending
+  // login under an id the caller no longer has.
+  const exitCode = await Promise.race([
+    entry.proc.exited,
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), 15_000)),
+  ]);
+  // Kill BEFORE reading stderr, not after: if the race resolved via the
+  // timeout (child still alive, e.g. a wrong code that never exits), its
+  // stderr stream never reaches EOF on its own -- `.text()` on a live
+  // stream hangs forever. Killing first closes the pipe so `.text()` can
+  // actually resolve either way.
+  entry.proc.kill();
+  const stderrText = await new Response(entry.proc.stderr).text().catch(() => "");
+
+  if (exitCode === 0) {
+    log("info", "auth_login_completed", { loginId });
+    return { success: true, message: "Login completed." };
+  }
+  log("warn", "auth_login_code_rejected", { loginId, exitCode, stderr: stderrText.trim() });
+  return {
+    success: false,
+    message: stderrText.trim() || "Login did not complete — the code may be wrong or expired. Start over with a new login.",
+  };
+}
+
+function getAuthStatus(): Record<string, unknown> {
+  if (!Bun.which("claude")) {
+    return { loggedIn: false, error: "claude CLI not found on PATH" };
+  }
+  const result = Bun.spawnSync(["claude", "auth", "status"]);
+  if (result.exitCode !== 0) {
+    return { loggedIn: false, error: result.stderr.toString().trim() };
+  }
+  try {
+    return JSON.parse(result.stdout.toString());
+  } catch {
+    return { loggedIn: false, error: "Could not parse `claude auth status` output." };
+  }
+}
+
 // Data carried on each take-the-wheel terminal WebSocket. Typing this lets Bun
 // infer the upgrade data type and keeps ws.data.* fully checked.
 interface TerminalWSData {
@@ -1437,6 +1574,29 @@ const server = Bun.serve({
         };
         if (param) return Response.json(check(sanitizeSession(param)));
         return Response.json({ sessions: listSessions().map((s) => check(s.session)) });
+      }),
+    },
+
+    "/auth/status": {
+      GET: authed(() => Response.json(getAuthStatus())),
+    },
+
+    "/auth/login": {
+      POST: authed(async () => {
+        const result = await startAuthLogin();
+        if ("error" in result) return Response.json(result, { status: 502 });
+        return Response.json(result);
+      }),
+    },
+
+    "/auth/login/:loginId/code": {
+      POST: authed(async (req) => {
+        const loginId = sanitizeId(req.params.loginId);
+        const body = await readJson(req);
+        const code = typeof body?.code === "string" ? body.code.trim() : "";
+        if (!code) return Response.json({ error: "code is required" }, { status: 400 });
+        const result = await submitAuthLoginCode(loginId, code);
+        return Response.json(result, { status: result.success ? 200 : 422 });
       }),
     },
 
