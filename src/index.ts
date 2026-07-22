@@ -1403,29 +1403,56 @@ function finishMapRun(run: MapRun, partial: boolean) {
   dispatchOrQueue(run.reduce.session, prompt, { id: reduceTaskId, source: `map:${run.runId}` });
 }
 
-// --- Claude Code account auth (W1.1) ----------------------------------------
+// --- Claude Code account auth (W1.1, redesigned W1.6) ------------------------
 // Lets an operator authenticate (or re-authenticate) THIS container's own
 // Claude Code / Anthropic login through the API, instead of the manual
 // `docker compose exec -it haiflow claude` terminal step (see
-// servicenow-ai-factory's infra/haiflow/README.md). Confirmed empirically
-// (2026-07-21 POC, disposable container, never touched a real account)
-// before building this: `claude auth login` prints its OAuth URL to stdout
-// within ~1-2s even with piped (non-TTY) stdio, then genuinely reads a
-// pasted authorization code from stdin (not just a decorative prompt).
+// servicenow-ai-factory's infra/haiflow/README.md).
+//
+// W1.1 originally drove this through `claude auth login`, a separate CLI
+// subcommand -- confirmed working on its own terms (populates
+// `claude auth status`), but W1.5/W1.6 found the real gap: the INTERACTIVE
+// REPL that /trigger actually spawns (`claude --permission-mode auto` in a
+// tmux pane) does its own first-ever-launch check, completely independent
+// of whatever `claude auth login` wrote. On a brand-new $HOME it unconditionally
+// opens a *fresh* OAuth flow the first time you reach "Select login method" --
+// confirmed by hand, including with a genuinely valid, already-authenticated
+// `claude auth login` session sitting right there: it still made a new
+// authorize URL instead of reusing it. So a `claude auth login`-only account
+// looked authenticated (`/auth/status` said so) but its first real /trigger
+// dispatch hung forever on this exact screen with no human present to answer it.
+//
+// Fix: drive the SAME interactive tmux flow /trigger will later reuse --
+// theme picker -> select-login-method -> paste the real code -- in a
+// dedicated, throwaway tmux session. Once that one real walkthrough
+// completes, this $HOME is durably past its first-launch gate (confirmed:
+// the original "haiflow"/"haiflow-w1-test" accounts, both authenticated this
+// way by a human, never re-show the wizard on later /trigger dispatches
+// under different session names). A NEW tmux session per /trigger call is
+// still a NEW tmux session, but the gate that matters lives in $HOME on
+// disk, not in the pane.
 //
 // One container = one account (see the multi-account design note in
 // AgenticUI's TASKS.md, W1 section) -- this auth flow only ever touches
 // the ONE Claude Code login this container's $HOME holds, never a
-// "session" by name the way /trigger's `session` param does.
+// "session" by name the way /trigger's `session` param does. Reuses
+// dismissClaudeStartupPrompt/isWorkspaceTrustPrompt (same first-run prompt
+// detection /trigger's own startClaudeSession relies on) rather than
+// duplicating that logic.
+
+const LOGIN_TMUX_SESSION = "__haiflow_login__";
+const LOGIN_READY_TIMEOUT_MS = 15_000;
+const LOGIN_CODE_TIMEOUT_MS = 20_000;
+const OAUTH_URL_PATTERN = /(https:\/\/claude\.(?:ai|com)\/\S*oauth\S*)/;
 
 interface PendingLogin {
-  proc: Subprocess<"pipe", "pipe", "pipe">;
   createdAt: number;
 }
 
 // Abandoned logins (operator opened the link, never came back with a code)
-// would otherwise leak a child process forever -- same cleanup spirit as
-// stopClaudeSession for a dead tmux pane, just for this instead.
+// would otherwise leave the throwaway tmux pane running forever -- same
+// cleanup spirit as stopClaudeSession for a dead real session, just for
+// this dedicated one instead.
 const PENDING_LOGIN_TTL_MS = 5 * 60 * 1000;
 const pendingLogins = new Map<string, PendingLogin>();
 
@@ -1433,51 +1460,80 @@ function reapAbandonedLogins() {
   const now = Date.now();
   for (const [id, entry] of pendingLogins) {
     if (now - entry.createdAt > PENDING_LOGIN_TTL_MS) {
-      entry.proc.kill();
       pendingLogins.delete(id);
       log("warn", "auth_login_reaped", { loginId: id });
     }
   }
+  if (pendingLogins.size === 0) killLoginTmuxSession();
 }
 
-async function startAuthLogin(): Promise<{ loginId: string; url: string } | { error: string }> {
+function killLoginTmuxSession() {
+  Bun.spawnSync(["tmux", "kill-session", "-t", LOGIN_TMUX_SESSION]);
+}
+
+async function startAuthLogin(): Promise<
+  { loginId: string; url: string } | { alreadyAuthenticated: true } | { error: string }
+> {
   reapAbandonedLogins();
   if (!Bun.which("claude")) {
     return { error: "claude CLI not found on PATH" };
   }
 
-  const proc = Bun.spawn(["claude", "auth", "login"], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
-  const loginId = prefixedId("login");
-  const reader = proc.stdout.getReader();
-  const decoder = new TextDecoder();
-  let buffered = "";
-  // The URL line prints within ~1-2s in practice (POC-confirmed); 10s gives
-  // real headroom without leaving a caller hanging on a broken CLI.
-  const deadline = Date.now() + 10_000;
+  // Clean slate -- a stale pane from an abandoned previous attempt would
+  // otherwise confuse the prompt-matching below (or just serve an old URL).
+  pendingLogins.clear();
+  killLoginTmuxSession();
 
-  try {
-    while (Date.now() < deadline) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffered += decoder.decode(value, { stream: true });
-      const match = buffered.match(/visit:\s*(\S+)/);
-      const url = match?.[1];
-      if (url) {
-        pendingLogins.set(loginId, { proc, createdAt: Date.now() });
-        log("info", "auth_login_started", { loginId });
-        return { loginId, url };
-      }
-    }
-  } finally {
-    // Only release, never cancel -- once handed off, submitAuthLoginCode
-    // owns proc's lifecycle. Leaving the reader locked would deadlock the
-    // stdin write later (Bun ties stdin/stdout flow control together).
-    reader.releaseLock();
+  const spawned = Bun.spawnSync([
+    "tmux", "new-session", "-d", "-s", LOGIN_TMUX_SESSION, "-x", "200", "-y", "50", "-c", DEFAULT_CWD,
+    "claude", "--permission-mode", "auto",
+  ]);
+  if (spawned.exitCode !== 0) {
+    return { error: `Failed to start Claude Code: ${spawned.stderr.toString().trim()}` };
   }
 
-  proc.kill();
-  log("error", "auth_login_url_not_found", { loginId });
-  return { error: "Did not see an authorization URL from `claude auth login` in time." };
+  const deadline = Date.now() + LOGIN_READY_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const pane = capturePane(LOGIN_TMUX_SESSION);
+
+    if (isWorkspaceTrustPrompt(pane)) {
+      if (!AUTO_ACCEPT_WORKSPACE_TRUST) {
+        killLoginTmuxSession();
+        return { error: "Claude Code is waiting for workspace trust confirmation on the login pane — set HAIFLOW_AUTO_ACCEPT_WORKSPACE_TRUST=true." };
+      }
+      Bun.spawnSync(["tmux", "send-keys", "-t", LOGIN_TMUX_SESSION, "Enter"]);
+      await Bun.sleep(300);
+      continue;
+    }
+
+    if (dismissClaudeStartupPrompt("auth-login", LOGIN_TMUX_SESSION, pane)) {
+      await Bun.sleep(300);
+      continue;
+    }
+
+    const urlMatch = pane.match(OAUTH_URL_PATTERN);
+    if (urlMatch?.[1]) {
+      const loginId = prefixedId("login");
+      pendingLogins.set(loginId, { createdAt: Date.now() });
+      log("info", "auth_login_started", { loginId });
+      return { loginId, url: urlMatch[1] };
+    }
+
+    if (pane.includes("❯")) {
+      // No known prompt to dismiss and no login URL either -- this $HOME
+      // was already past its first-launch gate (a genuinely fresh one
+      // always shows the wizard first), so there's nothing to do.
+      killLoginTmuxSession();
+      log("info", "auth_login_already_authenticated", {});
+      return { alreadyAuthenticated: true };
+    }
+
+    await Bun.sleep(300);
+  }
+
+  killLoginTmuxSession();
+  log("error", "auth_login_url_not_found", {});
+  return { error: "Did not reach a login prompt in Claude Code in time." };
 }
 
 async function submitAuthLoginCode(loginId: string, code: string): Promise<{ success: boolean; message: string }> {
@@ -1487,41 +1543,34 @@ async function submitAuthLoginCode(loginId: string, code: string): Promise<{ suc
   }
   pendingLogins.delete(loginId);
 
-  // .write() alone can leave the bytes sitting in Bun's internal FileSink
-  // buffer without ever reaching the child's stdin pipe -- .flush() pushes
-  // them through. Deliberately NOT calling .end() (closing the descriptor):
-  // `claude auth login` reads the code via a line-buffered prompt, not EOF,
-  // and closing stdin here hung the child indefinitely in testing (it
-  // never got to react to the pasted line at all) -- the working POC never
-  // closed stdin either, just wrote the line and left the pipe open.
-  entry.proc.stdin.write(`${code}\n`);
-  await entry.proc.stdin.flush();
-
-  // A WRONG code does not exit the process (POC-confirmed: it just prints
-  // "Invalid code..." to stderr and keeps waiting) -- race against a
-  // timeout instead of trusting `exited` to always settle, and kill the
-  // child either way so a bad attempt can't linger as a phantom pending
-  // login under an id the caller no longer has.
-  const exitCode = await Promise.race([
-    entry.proc.exited,
-    new Promise<null>((resolve) => setTimeout(() => resolve(null), 15_000)),
-  ]);
-  // Kill BEFORE reading stderr, not after: if the race resolved via the
-  // timeout (child still alive, e.g. a wrong code that never exits), its
-  // stderr stream never reaches EOF on its own -- `.text()` on a live
-  // stream hangs forever. Killing first closes the pipe so `.text()` can
-  // actually resolve either way.
-  entry.proc.kill();
-  const stderrText = await new Response(entry.proc.stderr).text().catch(() => "");
-
-  if (exitCode === 0) {
-    log("info", "auth_login_completed", { loginId });
-    return { success: true, message: "Login completed." };
+  if (!isTmuxRunning(LOGIN_TMUX_SESSION)) {
+    return { success: false, message: "The login session is no longer running — start over with a new login." };
   }
-  log("warn", "auth_login_code_rejected", { loginId, exitCode, stderr: stderrText.trim() });
+
+  // -l (literal) so tmux never interprets any character in the pasted code
+  // (dashes, '#', etc.) as a key name; Enter is a separate, non-literal key.
+  Bun.spawnSync(["tmux", "send-keys", "-t", LOGIN_TMUX_SESSION, "-l", code]);
+  Bun.spawnSync(["tmux", "send-keys", "-t", LOGIN_TMUX_SESSION, "Enter"]);
+
+  const deadline = Date.now() + LOGIN_CODE_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    await Bun.sleep(400);
+    const pane = capturePane(LOGIN_TMUX_SESSION);
+    if (pane.includes("❯") && !OAUTH_URL_PATTERN.test(pane)) {
+      // Past the paste-code screen and no known prompt left -- the one real
+      // walkthrough is done, so this $HOME is now durably onboarded. Kill
+      // the throwaway pane; every future /trigger spawns its own anyway.
+      killLoginTmuxSession();
+      log("info", "auth_login_completed", { loginId });
+      return { success: true, message: "Login completed." };
+    }
+  }
+
+  killLoginTmuxSession();
+  log("warn", "auth_login_code_rejected", { loginId });
   return {
     success: false,
-    message: stderrText.trim() || "Login did not complete — the code may be wrong or expired. Start over with a new login.",
+    message: "Login did not complete — the code may be wrong or expired. Start over with a new login.",
   };
 }
 
