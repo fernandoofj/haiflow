@@ -1193,16 +1193,6 @@ function capturePane(target: string): string {
   return pane.stdout.toString();
 }
 
-// -J joins wrapped lines back into one logical line -- needed only where a
-// single rendered line can be longer than the pane's column width, like the
-// OAuth authorize URL in the login flow below (a plain capture truncates it
-// at tmux's own wrap point, well before the real end of the URL).
-function capturePaneJoined(target: string): string {
-  const pane = Bun.spawnSync(["tmux", "capture-pane", "-t", target, "-p", "-J"]);
-  if (pane.exitCode !== 0) return "";
-  return pane.stdout.toString();
-}
-
 function isWorkspaceTrustPrompt(pane: string): boolean {
   return pane.includes("Quick safety check")
     && pane.includes("Yes, I trust this folder");
@@ -1453,7 +1443,27 @@ function finishMapRun(run: MapRun, partial: boolean) {
 const LOGIN_TMUX_SESSION = "__haiflow_login__";
 const LOGIN_READY_TIMEOUT_MS = 15_000;
 const LOGIN_CODE_TIMEOUT_MS = 20_000;
-const OAUTH_URL_PATTERN = /(https:\/\/claude\.(?:ai|com)\/\S*oauth\S*)/;
+
+// Claude Code prints the OAuth authorize URL across several literal lines --
+// confirmed with `tmux capture-pane -J` (which only rejoins the terminal's
+// OWN soft-wraps) that these stay separate even joined, so this is the CLI's
+// own hard newlines, not a wrap tmux can undo. The one reliable marker: every
+// surrounding chrome line ("Browser didn't open?...", "Paste code here...")
+// is indented with a leading space, while the URL's own lines start at
+// column 0 -- so "consecutive column-0 lines starting from the https://
+// line" reconstructs it losslessly (the URL itself never contains a space).
+function extractOauthUrl(pane: string): string | null {
+  const lines = pane.split("\n");
+  const startIdx = lines.findIndex((line) => /^https:\/\/claude\.(ai|com)\//.test(line));
+  if (startIdx === -1) return null;
+  let url = "";
+  for (let i = startIdx; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line || /^\s/.test(line)) break;
+    url += line;
+  }
+  return url || null;
+}
 
 interface PendingLogin {
   createdAt: number;
@@ -1504,7 +1514,7 @@ async function startAuthLogin(): Promise<
 
   const deadline = Date.now() + LOGIN_READY_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    const pane = capturePaneJoined(LOGIN_TMUX_SESSION);
+    const pane = capturePane(LOGIN_TMUX_SESSION);
 
     if (isWorkspaceTrustPrompt(pane)) {
       if (!AUTO_ACCEPT_WORKSPACE_TRUST) {
@@ -1521,12 +1531,12 @@ async function startAuthLogin(): Promise<
       continue;
     }
 
-    const urlMatch = pane.match(OAUTH_URL_PATTERN);
-    if (urlMatch?.[1]) {
+    const url = extractOauthUrl(pane);
+    if (url) {
       const loginId = prefixedId("login");
       pendingLogins.set(loginId, { createdAt: Date.now() });
       log("info", "auth_login_started", { loginId });
-      return { loginId, url: urlMatch[1] };
+      return { loginId, url };
     }
 
     if (pane.includes("❯")) {
@@ -1566,7 +1576,7 @@ async function submitAuthLoginCode(loginId: string, code: string): Promise<{ suc
   while (Date.now() < deadline) {
     await Bun.sleep(400);
     const pane = capturePane(LOGIN_TMUX_SESSION);
-    if (pane.includes("❯") && !OAUTH_URL_PATTERN.test(pane)) {
+    if (pane.includes("❯") && !extractOauthUrl(pane)) {
       // Past the paste-code screen and no known prompt left -- the one real
       // walkthrough is done, so this $HOME is now durably onboarded. Kill
       // the throwaway pane; every future /trigger spawns its own anyway.
