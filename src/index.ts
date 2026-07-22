@@ -1193,6 +1193,16 @@ function capturePane(target: string): string {
   return pane.stdout.toString();
 }
 
+// -J joins wrapped lines back into one logical line -- needed only where a
+// single rendered line can be longer than the pane's column width, like the
+// OAuth authorize URL in the login flow below (a plain capture truncates it
+// at tmux's own wrap point, well before the real end of the URL).
+function capturePaneJoined(target: string): string {
+  const pane = Bun.spawnSync(["tmux", "capture-pane", "-t", target, "-p", "-J"]);
+  if (pane.exitCode !== 0) return "";
+  return pane.stdout.toString();
+}
+
 function isWorkspaceTrustPrompt(pane: string): boolean {
   return pane.includes("Quick safety check")
     && pane.includes("Yes, I trust this folder");
@@ -1494,7 +1504,7 @@ async function startAuthLogin(): Promise<
 
   const deadline = Date.now() + LOGIN_READY_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    const pane = capturePane(LOGIN_TMUX_SESSION);
+    const pane = capturePaneJoined(LOGIN_TMUX_SESSION);
 
     if (isWorkspaceTrustPrompt(pane)) {
       if (!AUTO_ACCEPT_WORKSPACE_TRUST) {
