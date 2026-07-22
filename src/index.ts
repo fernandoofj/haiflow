@@ -1573,9 +1573,25 @@ async function submitAuthLoginCode(loginId: string, code: string): Promise<{ suc
   Bun.spawnSync(["tmux", "send-keys", "-t", LOGIN_TMUX_SESSION, "Enter"]);
 
   const deadline = Date.now() + LOGIN_CODE_TIMEOUT_MS;
+  let confirmedSuccess = false;
   while (Date.now() < deadline) {
     await Bun.sleep(400);
     const pane = capturePane(LOGIN_TMUX_SESSION);
+
+    // A correct code doesn't land straight on the normal chat prompt -- it
+    // shows its own confirmation screen ("Logged in as ...", "Login
+    // successful. Press Enter to continue…") and WAITS for that Enter.
+    // Missing this the first time through cost a whole real login attempt:
+    // watching a raw pane dump mid-run showed the code had already
+    // succeeded while this function kept polling for "❯" that would only
+    // ever appear after this keypress, and eventually timed out reporting
+    // failure on a login that had actually worked.
+    if (!confirmedSuccess && pane.includes("Login successful")) {
+      confirmedSuccess = true;
+      Bun.spawnSync(["tmux", "send-keys", "-t", LOGIN_TMUX_SESSION, "Enter"]);
+      continue;
+    }
+
     if (pane.includes("❯") && !extractOauthUrl(pane)) {
       // Past the paste-code screen and no known prompt left -- the one real
       // walkthrough is done, so this $HOME is now durably onboarded. Kill
