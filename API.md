@@ -216,6 +216,37 @@ curl -s -H "Authorization: Bearer $HAIFLOW_API_KEY" "http://localhost:3333/docto
 
 With no `session`, returns `{ "sessions": [...] }` for all sessions. Each report has `status`, `tmuxRunning`, `hooksLinked`, `healthy`, and a `note` when something is wrong. The CLI wraps this as `haiflow doctor [session]`, and `haiflow init [dir]` runs hooks + start + a smoke test end to end.
 
+## Account authentication
+
+Lets an operator authenticate (or re-authenticate) this container's own Claude Code / Anthropic login through the API, instead of attaching a terminal to run `claude` by hand. Drives the same interactive first-run walkthrough `/session/start` itself relies on (theme picker, login-method screen, then the real OAuth code exchange) in a dedicated throwaway tmux session (`__haiflow_login__`) — not the separate `claude auth login` CLI subcommand, which authenticates for real but never satisfies the interactive REPL's own first-launch check, so a `claude auth login`-only account's first real dispatch would hang forever on that screen with no human present to answer it.
+
+### `GET /auth/status`
+
+Wraps `claude auth status`. Returns `{ "loggedIn": true, "email": "...", "subscriptionType": "...", ... }` when authenticated, or `{ "loggedIn": false, "error": "..." }` otherwise.
+
+### `POST /auth/login`
+
+```bash
+curl -X POST -H "Authorization: Bearer $HAIFLOW_API_KEY" http://localhost:3333/auth/login
+```
+
+Starts the walkthrough and returns as soon as it reaches something the caller must act on:
+
+- `{ "loginId": "login_...", "url": "https://claude.com/..." }` — open the URL, authorize, and pass the resulting code to `/auth/login/:loginId/code` below.
+- `{ "alreadyAuthenticated": true }` — this `$HOME` already completed a real walkthrough before; nothing to do.
+- `409`/`502` with `{ "error": "..." }` — couldn't reach a login prompt in time, or Claude Code is waiting on a workspace-trust confirmation on the login pane itself (same `HAIFLOW_AUTO_ACCEPT_WORKSPACE_TRUST` escape hatch as `/session/start`).
+
+### `POST /auth/login/:loginId/code`
+
+```bash
+curl -X POST -H "Authorization: Bearer $HAIFLOW_API_KEY" -H "Content-Type: application/json" \
+  http://localhost:3333/auth/login/login_.../code -d '{"code": "the-code-from-the-authorize-page"}'
+```
+
+Submits the pasted code into the same tmux session, dismisses every post-login screen (login confirmation, security notice, workspace trust), and returns `{ "success": true, "message": "Login completed." }` once the session reaches a real ready prompt, or `{ "success": false, "message": "..." }` (`422`) if the code was wrong/expired or the walkthrough didn't complete in time.
+
+A genuinely brand-new account may need this walkthrough completed more than once before `/session/start`'s own interactive mode stops re-showing its first-run wizard on a fresh tmux session — a Claude Code CLI behavior (tied to its own startup counter), not something this endpoint can shortcut. `claude auth status` reporting logged in does not by itself guarantee the interactive mode is past onboarding; only a real `/trigger` dispatch does.
+
 ## `GET /responses`
 
 List all completed response IDs.
