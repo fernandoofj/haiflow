@@ -1201,23 +1201,38 @@ function isWorkspaceTrustPrompt(pane: string): boolean {
 function dismissClaudeStartupPrompt(session: string, target: string, pane: string): boolean {
   const prompt = startupPromptName(pane);
   if (!prompt) return false;
-  Bun.spawnSync(["tmux", "send-keys", "-t", target, "Escape"]);
-  log("warn", "session_start_onboarding_prompt_dismissed", { session, prompt });
+  Bun.spawnSync(["tmux", "send-keys", "-t", target, prompt.key]);
+  log("warn", "session_start_onboarding_prompt_dismissed", { session, prompt: prompt.name });
   return true;
 }
 
-function startupPromptName(pane: string): string | null {
+// A brand-new $HOME (no prior interactive `claude` run) walks through its own
+// first-run wizard the first time the REPL -- not `claude auth login`, a
+// separate subprocess -- is spawned interactively: a theme picker, then a
+// "select login method" screen that shows even when `claude auth status`
+// already reports logged in (confirmed by hand: it just proceeds using the
+// existing credentials). Both screens pre-highlight the sane default
+// (dark mode / the account already authenticated via W1.1's login flow), so
+// Enter accepts it, the same way Escape already dismisses the two optional
+// feature-announcement prompts below.
+function startupPromptName(pane: string): { name: string; key: string } | null {
   if (
     pane.includes("Claude in Chrome extension detected")
     && pane.includes("Yes, use my browser")
   ) {
-    return "chrome_integration";
+    return { name: "chrome_integration", key: "Escape" };
   }
   if (
     pane.includes("Try the new fullscreen renderer")
     && pane.includes("Yes, try it")
   ) {
-    return "fullscreen_renderer";
+    return { name: "fullscreen_renderer", key: "Escape" };
+  }
+  if (pane.includes("Choose the text style that looks best")) {
+    return { name: "theme_picker", key: "Enter" };
+  }
+  if (pane.includes("Select login method")) {
+    return { name: "login_method_picker", key: "Enter" };
   }
   return null;
 }
