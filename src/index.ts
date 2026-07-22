@@ -1573,29 +1573,37 @@ async function submitAuthLoginCode(loginId: string, code: string): Promise<{ suc
   Bun.spawnSync(["tmux", "send-keys", "-t", LOGIN_TMUX_SESSION, "Enter"]);
 
   const deadline = Date.now() + LOGIN_CODE_TIMEOUT_MS;
-  let confirmedSuccess = false;
   while (Date.now() < deadline) {
     await Bun.sleep(400);
     const pane = capturePane(LOGIN_TMUX_SESSION);
 
-    // A correct code doesn't land straight on the normal chat prompt -- it
-    // shows its own confirmation screen ("Logged in as ...", "Login
-    // successful. Press Enter to continue…") and WAITS for that Enter.
-    // Missing this the first time through cost a whole real login attempt:
-    // watching a raw pane dump mid-run showed the code had already
-    // succeeded while this function kept polling for "❯" that would only
-    // ever appear after this keypress, and eventually timed out reporting
-    // failure on a login that had actually worked.
-    if (!confirmedSuccess && pane.includes("Login successful")) {
-      confirmedSuccess = true;
+    // A correct code doesn't land straight on the normal chat prompt -- it's
+    // actually a short SEQUENCE of confirmation screens, each waiting on its
+    // own Enter: "Logged in as ... / Login successful.", then a security
+    // notice, then (first `claude` launch ever) the workspace-trust check
+    // for this cwd. Watched a real code submission live to find this out:
+    // the code succeeded on the first try, but this function only ever
+    // polled for "❯" -- which none of those intermediate screens show -- so
+    // it sat there for the full timeout and reported a false failure on a
+    // login that had actually worked.
+    if (pane.includes("Press Enter to continue")) {
+      Bun.spawnSync(["tmux", "send-keys", "-t", LOGIN_TMUX_SESSION, "Enter"]);
+      continue;
+    }
+
+    if (isWorkspaceTrustPrompt(pane)) {
+      if (!AUTO_ACCEPT_WORKSPACE_TRUST) {
+        killLoginTmuxSession();
+        return { success: false, message: "Login succeeded, but Claude Code is waiting for workspace trust confirmation — set HAIFLOW_AUTO_ACCEPT_WORKSPACE_TRUST=true." };
+      }
       Bun.spawnSync(["tmux", "send-keys", "-t", LOGIN_TMUX_SESSION, "Enter"]);
       continue;
     }
 
     if (pane.includes("❯") && !extractOauthUrl(pane)) {
-      // Past the paste-code screen and no known prompt left -- the one real
-      // walkthrough is done, so this $HOME is now durably onboarded. Kill
-      // the throwaway pane; every future /trigger spawns its own anyway.
+      // Past every known post-login screen -- the one real walkthrough is
+      // done, so this $HOME is now durably onboarded. Kill the throwaway
+      // pane; every future /trigger spawns its own anyway.
       killLoginTmuxSession();
       log("info", "auth_login_completed", { loginId });
       return { success: true, message: "Login completed." };
