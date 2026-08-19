@@ -1,7 +1,7 @@
 import { readFileSync, existsSync, mkdirSync, readdirSync, writeFileSync, unlinkSync, statSync, renameSync, rmSync } from "fs";
 import type { ServerWebSocket, Subprocess } from "bun";
 import {
-  sanitizeSession, sanitizeId, generateId, prefixedId, tmuxName,
+  sanitizeSession, sanitizeId, generateId, prefixedId, tmuxName, sanitizeModel,
   validateStructural,
   isAllowedTranscriptPath, renderTemplate, recoverSessionPatch,
   checkRateLimit, type RateWindow,
@@ -304,6 +304,16 @@ interface State {
   currentTaskId?: string;
   currentChain?: string[];
   queueLength: number;
+  // CF-315: o modelo com que ESTA sessao subiu.
+  //
+  // `null` nao e "nao sei": e o registro de que a sessao subiu SEM escolha
+  // explicita, e portanto roda o default da conta. A diferenca importa porque
+  // o pedido do Fernando foi justamente que `auto` deixasse de ser um estado
+  // implicito -- para aparecer, ele tem de estar gravado em algum lugar.
+  //
+  // Nao pode ser trocado sem derrubar a sessao: o `claude` recebe `--model` no
+  // arranque e e um processo longo.
+  model?: string | null;
   // Watchdog fields. `waiting` is set by the Notification hook when Claude is
   // blocked needing input mid-task; `deadlineAt` is the optional hard timeout.
   waiting?: boolean;
@@ -1083,9 +1093,40 @@ async function waitForGuardrailComplete(session: string, maxWait = 30_000): Prom
   log("warn", "guardrail_idle_timeout", { session });
 }
 
-async function startClaudeSession(session: string, cwd: string): Promise<{ success: boolean; error?: string; ready?: boolean }> {
+/**
+ * CF-315: `model` decide o que o `claude` roda, e so vale no ARRANQUE.
+ *
+ * `null`/ausente = subir sem `--model`, ou seja, o default da conta. Isso e
+ * registrado no estado como `model: null` em vez de ficar implicito: o pedido
+ * do Fernando foi que `auto` deixasse de acontecer por omissao.
+ */
+async function startClaudeSession(
+  session: string,
+  cwd: string,
+  model: string | null = null,
+): Promise<{ success: boolean; error?: string; ready?: boolean; modelMismatch?: { running: string | null; requested: string | null } }> {
   const target = tmuxName(session);
   if (isTmuxRunning(session)) {
+    // CF-315: reusar uma sessao que roda OUTRO modelo e o "sucesso mudo" que
+    // esta task inteira existe para acabar. O `--model` vale no arranque, e um
+    // processo ja de pe nao muda de modelo -- devolver `success` aqui faria a
+    // tarefa rodar num modelo que ninguem escolheu, exatamente o defeito
+    // original, so que agora com a configuracao certa na tela.
+    //
+    // Nao derruba a sessao por conta propria: quem pediu decide se mata e
+    // recria (pode haver trabalho em voo la dentro). Aqui a resposta e o fato.
+    const emUso = readState(session).model ?? null;
+    if (emUso !== model) {
+      log("warn", "session_start_model_mismatch", { session, running: emUso, requested: model });
+      return {
+        success: false,
+        error:
+          `Session '${session}' is already running with model ` +
+          `${emUso ?? "auto (account default)"}, but ${model ?? "auto (account default)"} was requested. ` +
+          `--model only applies at startup: stop the session before starting it with a different model.`,
+        modelMismatch: { running: emUso, requested: model },
+      };
+    }
     const pane = capturePane(target);
     if (isWorkspaceTrustPrompt(pane)) {
       if (!AUTO_ACCEPT_WORKSPACE_TRUST) return workspaceTrustRequired(session, cwd);
@@ -1096,7 +1137,7 @@ async function startClaudeSession(session: string, cwd: string): Promise<{ succe
     } else if (dismissClaudeStartupPrompt(session, target, pane)) {
       writeState(session, { status: "idle", since: new Date().toISOString(), cwd });
     } else {
-      log("info", "session_reused", { session });
+      log("info", "session_reused", { session, model: emUso });
       writeState(session, { status: "idle", since: new Date().toISOString(), cwd });
       return { success: true, ready: true };
     }
@@ -1111,20 +1152,30 @@ async function startClaudeSession(session: string, cwd: string): Promise<{ succe
   }
 
   if (!isTmuxRunning(session)) {
-    const result = Bun.spawnSync([
+    // CF-315: `--model` so entra quando houve escolha. Sem escolha, o comando
+    // fica EXATAMENTE como era -- nao inventar um default aqui e o ponto: um
+    // default escondido no gateway seria a mesma classe de problema que o
+    // `auto` implicito, so que mais dificil de enxergar.
+    const argv = [
       "tmux", "new-session", "-d", "-s", target, "-c", cwd,
       "-e", `HAIFLOW=1`,
       "-e", `HAIFLOW_PORT=${PORT}`,
       "claude", "--permission-mode", "auto",
-    ]);
+    ];
+    if (model) argv.push("--model", model);
+
+    const result = Bun.spawnSync(argv);
 
     if (result.exitCode !== 0) {
-      log("error", "session_start_failed", { session, error: result.stderr.toString() });
+      log("error", "session_start_failed", { session, error: result.stderr.toString(), model });
       return { success: false, error: result.stderr.toString() };
     }
 
     setSessionId(session, null);
-    writeState(session, { status: "idle", since: new Date().toISOString(), cwd });
+    // O modelo e gravado JUNTO com o arranque, e nao depois: e ele que permite
+    // a proxima chamada saber com o que esta sessao esta rodando.
+    writeState(session, { status: "idle", since: new Date().toISOString(), cwd, model: model ?? null });
+    log("info", "session_started", { session, model: model ?? null, explicit: Boolean(model) });
   }
 
   // Block until Claude's TUI is actually interactive. The session-start hook
@@ -1272,13 +1323,17 @@ function getSessionParam(req: Request): string {
   return sanitizeSession(url.searchParams.get("session") ?? "default");
 }
 
-function listSessions(): { session: string; status: Status; tmux: string }[] {
+// CF-315: o modelo entra na LISTA, e nao so no detalhe de cada sessao. A
+// pergunta "o que esta consumindo?" e feita sobre o conjunto, no meio de um
+// incidente -- foi assim em 17 e em 18/08/2026 -- e uma resposta que exige uma
+// chamada por sessao nao e resposta.
+function listSessions(): { session: string; status: Status; tmux: string; model: string | null }[] {
   if (!existsSync(BASE_DIR)) return [];
   return readdirSync(BASE_DIR)
     .filter((d) => existsSync(`${BASE_DIR}/${d}/state.json`))
     .map((d) => {
       const state = readState(d);
-      return { session: d, status: state.status, tmux: tmuxName(d) };
+      return { session: d, status: state.status, tmux: tmuxName(d), model: state.model ?? null };
     });
 }
 
@@ -1738,6 +1793,16 @@ const server = Bun.serve({
         const ephemeral = body.ephemeral === true;
         const callbackUrl = typeof body.callbackUrl === "string" ? body.callbackUrl.trim() : undefined;
         const requestedCwd = typeof body.cwd === "string" ? body.cwd : undefined;
+        // CF-315: so vale para o arranque EFEMERO logo abaixo -- uma sessao ja
+        // de pe nao muda de modelo, e mandar `model` para ela nao faz nada.
+        // Modelo invalido e 400 aqui tambem, pela mesma razao do /session/start.
+        const triggerModel = sanitizeModel(body.model);
+        if (body.model !== undefined && body.model !== null && triggerModel === null) {
+          return Response.json(
+            { error: "Invalid 'model': expected letters, digits, '.', '_' or '-', not starting with '-'.", session },
+            { status: 400 },
+          );
+        }
         if (callbackUrl) {
           const v = validateCallbackUrl(callbackUrl);
           if (!v.ok) return Response.json({ error: v.reason, session }, { status: 400 });
@@ -1766,7 +1831,7 @@ const server = Bun.serve({
           // policy as /session/start so messages and overrides stay consistent.
           const { cwd, error } = resolveStartCwd(requestedCwd);
           if (error) return Response.json({ error, session }, { status: 400 });
-          const started = await startClaudeSession(session, cwd!);
+          const started = await startClaudeSession(session, cwd!, triggerModel);
           if (!started.success) {
             return Response.json({ error: started.error, session }, { status: 503 });
           }
@@ -2602,6 +2667,18 @@ const server = Bun.serve({
         const session = sanitizeSession((body.session as string) || "default");
         const requestedCwd = body.cwd as string | undefined;
 
+        // CF-315: "nao escolheu" e "escolheu errado" tem respostas diferentes.
+        // Ausente = sobe sem `--model` (default da conta, registrado como tal).
+        // Presente e invalido = 400, porque cair no default silenciosamente
+        // seria rodar um modelo que ninguem pediu -- o defeito desta task.
+        const model = sanitizeModel(body.model);
+        if (body.model !== undefined && body.model !== null && model === null) {
+          return Response.json(
+            { error: "Invalid 'model': expected letters, digits, '.', '_' or '-', not starting with '-'.", session },
+            { status: 400 },
+          );
+        }
+
         const { cwd, error, overridden, defaulted } = resolveStartCwd(requestedCwd, { allowDefault: true });
         if (error) {
           if (!FORCED_CWD && !ALLOW_REQUEST_CWD) {
@@ -2616,13 +2693,19 @@ const server = Bun.serve({
           log("info", "session_start_cwd_defaulted", { session, cwd });
         }
 
-        const result = await startClaudeSession(session, cwd!);
+        const result = await startClaudeSession(session, cwd!, model);
         if (!result.success) {
-          return Response.json({ error: result.error, session }, { status: 409 });
+          return Response.json(
+            { error: result.error, session, ...(result.modelMismatch ? { modelMismatch: result.modelMismatch } : {}) },
+            { status: 409 },
+          );
         }
         return Response.json({
           started: true, session, tmux: tmuxName(session), cwd,
           ready: result.ready ?? true,
+          // O que de fato subiu. `null` = sem escolha explicita (default da
+          // conta) -- quem chama precisa poder DISTINGUIR isso de um modelo.
+          model: readState(session).model ?? null,
           ...(overridden ? { cwdOverridden: true } : {}),
           ...(defaulted ? { cwdDefaulted: true } : {}),
         });

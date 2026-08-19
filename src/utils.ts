@@ -3,8 +3,42 @@ import { realpathSync, statSync } from "fs";
 
 // --- Input sanitization ---
 
+// CF-315: 64 nao cabia mais, e o estouro era SILENCIOSO.
+//
+// O SNAF nomeia a sessao como `<run_id>-<stage>`, e um uuid (36) mais o stage
+// `architecture_contract_agent` (27) mais o hifen dao exatamente 64 -- o teto,
+// batido na trave. `requirements_compiler-revision` ja passava, e virava
+// `...-revis` na lista de sessoes; foi assim que apareceu na limpeza de
+// 18/08/2026. Truncar nao e cosmetico: dois nomes que so diferem depois do
+// corte viram A MESMA sessao, e duas tarefas passam a dividir uma sessao do
+// Claude -- contexto de uma vazando na outra.
+//
+// A CF-315 acrescenta o modelo ao nome (para o `tmux ls` denunciar o que cada
+// sessao consome), o que empurraria mais ainda. 96 da a folga que faltava sem
+// chegar perto de limite nenhum de tmux ou de nome de diretorio.
+export const MAX_SESSION_NAME = 96;
+
 export function sanitizeSession(name: string): string {
-  return name.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 64) || "default";
+  return name.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, MAX_SESSION_NAME) || "default";
+}
+
+// CF-315: o modelo vira ARGUMENTO da linha de comando do `claude`, e chega de
+// fora. Nao ha shell no meio (Bun.spawnSync recebe array), entao o risco nao e
+// injecao de shell -- e injecao de FLAG: um "modelo" chamado
+// `--dangerously-skip-permissions` seria passado ao claude como opcao, nao
+// como valor. Por isso a regra proibe hifen inicial, e nao apenas caracteres
+// estranhos.
+//
+// Devolve `null` quando nao ha escolha (ausente/vazio) e quando a escolha e
+// invalida -- quem chama distingue os dois casos antes de chamar, porque
+// "nao escolheu" e "escolheu errado" tem respostas diferentes.
+const MODEL_OK = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/;
+
+export function sanitizeModel(model: unknown): string | null {
+  if (typeof model !== "string") return null;
+  const limpo = model.trim();
+  if (!limpo || !MODEL_OK.test(limpo)) return null;
+  return limpo;
 }
 
 // A sortable-ish, collision-resistant id: `<prefix>_<ms>_<6 base36 chars>`.
