@@ -741,26 +741,33 @@ function readDisplayDeltas(session: string, taskId: string, offset = 0): { event
 //
 // A session with no display deltas (hook not configured, tool-only turn) is
 // closed by definition: zero wait, behavior unchanged.
+// The deadline is SILENCE-based, renewed by progress: a fixed clock from the
+// Stop hook cannot tell a dead stream from a long delta queue still draining
+// (a 220KB turn is hundreds of hook POSTs). While deltas keep arriving the
+// wait lives on; only STOP_STREAM_WAIT_MS of silence -- no new delta, no
+// final -- gives up. STOP_STREAM_MAX_WAIT_MS is the absolute ceiling so a
+// pathological stream can never pin the Stop handler.
 export const STOP_STREAM_WAIT_MS = Number(process.env.HAIFLOW_STOP_STREAM_WAIT_MS ?? "3000");
+export const STOP_STREAM_MAX_WAIT_MS = Number(process.env.HAIFLOW_STOP_STREAM_MAX_WAIT_MS ?? "15000");
 const STOP_STREAM_POLL_MS = 50;
 
-function lastDisplayDelta(session: string, taskId: string): DisplayDeltaEvent | null {
-  const { events } = readDisplayDeltas(session, taskId);
-  return events.length > 0 ? events[events.length - 1] : null;
-}
-
-function displayStreamClosed(session: string, taskId: string): boolean {
-  const last = lastDisplayDelta(session, taskId);
-  return !last || last.final === true;
-}
-
 async function waitForDisplayStreamClose(session: string, taskId: string): Promise<boolean> {
-  const deadline = Date.now() + STOP_STREAM_WAIT_MS;
-  while (!displayStreamClosed(session, taskId)) {
-    if (Date.now() >= deadline) return false;
+  const started = Date.now();
+  let seen = -1;
+  let lastProgress = started;
+  while (true) {
+    const { events } = readDisplayDeltas(session, taskId);
+    const last = events.length > 0 ? events[events.length - 1] : null;
+    if (!last || last.final === true) return true;
+    const now = Date.now();
+    if (events.length !== seen) {
+      seen = events.length;
+      lastProgress = now;
+    }
+    if (now - lastProgress >= STOP_STREAM_WAIT_MS) return false;
+    if (now - started >= STOP_STREAM_MAX_WAIT_MS) return false;
     await Bun.sleep(STOP_STREAM_POLL_MS);
   }
-  return true;
 }
 
 // The streamed messages, reassembled: deltas grouped by messageId in arrival
@@ -814,7 +821,7 @@ function saveIncompleteResponse(session: string, taskId: string, prompt?: string
     id: taskId, completed_at, prompt,
     messages: partial,
     error: "incomplete_stream",
-    error_detail: `the final message's display stream did not close within ${STOP_STREAM_WAIT_MS}ms of the Stop hook`,
+    error_detail: `the final message's display stream went silent without closing (${STOP_STREAM_WAIT_MS}ms without a new delta, or ${STOP_STREAM_MAX_WAIT_MS}ms total, after the Stop hook)`,
   }, null, 2));
   log("warn", "response_saved_incomplete", { session, taskId, waitedMs: STOP_STREAM_WAIT_MS, partialMessages: partial.length });
   return { messages: partial, completed_at };
