@@ -721,6 +721,105 @@ function readDisplayDeltas(session: string, taskId: string, offset = 0): { event
   }
 }
 
+
+// --- Stop-vs-stream race (2026-08-20) -------------------------------------
+//
+// The Stop hook and the message-display hook race. Measured on session
+// snaf-5ab706a65145-opus, task lc-0875b3b7: the response was saved at
+// 19:22:51.206Z while the final message's deltas kept arriving until .229 --
+// so extractFromTranscript mined a transcript that did not yet contain the
+// final message, and the saved response held only the opening narration.
+// The 34KB JSON the model actually produced was lost, and the caller's schema
+// validation failed against a one-line preamble. Twice in one afternoon.
+//
+// The display stream itself tells us when it is safe to mine: every message's
+// last delta carries `final: true`. So the Stop handler now (1) waits for the
+// stream to close, up to STOP_STREAM_WAIT_MS; (2) merges any streamed message
+// the transcript pass missed; (3) if the stream never closes, saves the record
+// with an `error` marker instead of passing a truncated answer off as the
+// real one -- callers get a clean failure they can retry, not silent garbage.
+//
+// A session with no display deltas (hook not configured, tool-only turn) is
+// closed by definition: zero wait, behavior unchanged.
+export const STOP_STREAM_WAIT_MS = Number(process.env.HAIFLOW_STOP_STREAM_WAIT_MS ?? "3000");
+const STOP_STREAM_POLL_MS = 50;
+
+function lastDisplayDelta(session: string, taskId: string): DisplayDeltaEvent | null {
+  const { events } = readDisplayDeltas(session, taskId);
+  return events.length > 0 ? events[events.length - 1] : null;
+}
+
+function displayStreamClosed(session: string, taskId: string): boolean {
+  const last = lastDisplayDelta(session, taskId);
+  return !last || last.final === true;
+}
+
+async function waitForDisplayStreamClose(session: string, taskId: string): Promise<boolean> {
+  const deadline = Date.now() + STOP_STREAM_WAIT_MS;
+  while (!displayStreamClosed(session, taskId)) {
+    if (Date.now() >= deadline) return false;
+    await Bun.sleep(STOP_STREAM_POLL_MS);
+  }
+  return true;
+}
+
+// The streamed messages, reassembled: deltas grouped by messageId in arrival
+// order, concatenated. This is the gateway's own copy of what the model said
+// -- the belt to the transcript's suspenders.
+function messagesFromDisplayBuffer(session: string, taskId: string): string[] {
+  const { events } = readDisplayDeltas(session, taskId);
+  const byMessage = new Map<string, string[]>();
+  for (const event of events) {
+    const key = event.messageId ?? "(sem-id)";
+    const parts = byMessage.get(key) ?? [];
+    parts.push(event.delta);
+    byMessage.set(key, parts);
+  }
+  return [...byMessage.values()].map((parts) => parts.join("")).filter((text) => text.trim().length > 0);
+}
+
+// Append any streamed message the transcript pass missed. Deltas are already
+// redacted (appendDisplayDelta) while mined messages are raw until
+// saveResponse redacts them, so containment is checked on a 200-char
+// signature; a redaction inside the signature at worst duplicates a message,
+// which downstream JSON extraction tolerates -- losing the message does not.
+function mergeDisplayBuffer(session: string, taskId: string, mined: string[] | undefined): string[] | undefined {
+  const streamed = messagesFromDisplayBuffer(session, taskId);
+  if (streamed.length === 0) return mined;
+  const messages = [...(mined ?? [])];
+  let appended = 0;
+  for (const text of streamed) {
+    const signature = text.trim().slice(0, 200);
+    if (!signature) continue;
+    if (!messages.some((m) => m.includes(signature))) {
+      messages.push(text);
+      appended += 1;
+    }
+  }
+  if (appended > 0) log("info", "display_buffer_merged", { session, taskId, appended });
+  return messages.length > 0 ? messages : mined;
+}
+
+// The task ended (Stop fired) but its last message never closed -- the answer
+// is incomplete and no amount of waiting will finish it. Persist a definitive
+// record WITH an error marker: pollers see completion (same reason the
+// "(no text output)" fallback exists), and API consumers that check `error`
+// can fail fast and retry instead of validating a truncated answer.
+function saveIncompleteResponse(session: string, taskId: string, prompt?: string, messages?: string[], lastMessage?: string): { messages: string[]; completed_at: string } | undefined {
+  if (!taskId) return;
+  const file = responseFile(session, taskId);
+  const completed_at = new Date().toISOString();
+  const partial = (messages && messages.length > 0 ? messages : lastMessage ? [lastMessage] : []).map((m) => redactOut(String(m)).text);
+  writeFileSync(file, JSON.stringify({
+    id: taskId, completed_at, prompt,
+    messages: partial,
+    error: "incomplete_stream",
+    error_detail: `the final message's display stream did not close within ${STOP_STREAM_WAIT_MS}ms of the Stop hook`,
+  }, null, 2));
+  log("warn", "response_saved_incomplete", { session, taskId, waitedMs: STOP_STREAM_WAIT_MS, partialMessages: partial.length });
+  return { messages: partial, completed_at };
+}
+
 // Write atomically: write a temp file in the same dir, then rename over the
 // target. rename(2) is atomic on POSIX, so a reader never sees a half-written
 // file and a crash mid-write can't corrupt the existing one. This is what keeps
@@ -2468,12 +2567,23 @@ const server = Bun.serve({
 
         const state = readState(session);
         if (state.currentTaskId) {
+          // The final message may still be streaming when Stop fires (measured
+          // 23ms inversion, see STOP_STREAM_WAIT_MS above). Wait for the
+          // stream to close BEFORE mining, so the transcript pass sees the
+          // whole turn.
+          const streamClosed = await waitForDisplayStreamClose(session, state.currentTaskId);
           // Mine the transcript once for both the response capture and the
           // durable ledger (tool/command/diff timeline + token usage).
           const extract = (body.transcript_path && isAllowedTranscriptPath(body.transcript_path))
             ? extractFromTranscript(body.transcript_path)
             : null;
-          const saved = saveResponse(session, state.currentTaskId, state.currentPrompt, extract?.messages, body.last_assistant_message);
+          const saved = streamClosed
+            ? saveResponse(
+                session, state.currentTaskId, state.currentPrompt,
+                mergeDisplayBuffer(session, state.currentTaskId, extract?.messages),
+                body.last_assistant_message,
+              )
+            : saveIncompleteResponse(session, state.currentTaskId, state.currentPrompt, extract?.messages, body.last_assistant_message);
 
           recordTaskFinish({
             id: state.currentTaskId,
