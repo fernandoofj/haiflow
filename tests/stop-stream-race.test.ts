@@ -12,8 +12,9 @@
 // merged in; (3) a stream that never closes becomes an `error` record —
 // a clean failure to retry, never a truncated answer passed off as real.
 //
-// The server runs with HAIFLOW_STOP_STREAM_WAIT_MS=500 so the discard case
-// costs half a second, not the production 3s.
+// The server runs with HAIFLOW_STOP_STREAM_WAIT_MS=2000 so the discard case
+// costs two seconds, not the production 3s -- and the no-stream case still
+// has room to prove it never paid the wait at all.
 
 import { test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdirSync, writeFileSync, existsSync, rmSync, readFileSync, appendFileSync } from "fs";
