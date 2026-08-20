@@ -26,7 +26,7 @@ const TEST_DIR = "/tmp/haiflow-stop-race-test";
 const TRANSCRIIPT_DIR = "/tmp/claude/stop-race-fixtures";
 const TEST_API_KEY = "test-api-key";
 const BASE = `http://localhost:${TEST_PORT}`;
-const WAIT_MS = 500;
+const WAIT_MS = 2000;
 
 let server: ReturnType<typeof Bun.spawn>;
 
@@ -191,7 +191,10 @@ test("a task with no display deltas saves immediately, as before", async () => {
   const before = Date.now();
   const res = await hook("/hooks/stop", { session_id: claudeId, transcript_path: transcript });
   expect(res.status).toBe(200);
-  expect(Date.now() - before).toBeLessThan(WAIT_MS);
+  // Bem abaixo de WAIT_MS, com folga para o overhead fixo do request (~600ms
+  // medido no container): o que este teste recusa e a espera INTEIRA ser paga
+  // por um turno que nem tem stream.
+  expect(Date.now() - before).toBeLessThan(WAIT_MS - 500);
 
   const saved = savedResponse("plain", taskId);
   expect(saved.error).toBeUndefined();
