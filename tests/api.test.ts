@@ -656,15 +656,18 @@ describe("POST /hooks/stop (known session)", () => {
       last_assistant_message: "done",
     });
 
-    // After stop + drain, session should be busy with the next queued prompt
-    // (sendToTmux will fail since there's no real tmux, but state updates)
+    // After stop the drain tries the next queued item, but this test has no
+    // tmux session, so the send fails. The drain must then REQUEUE the item
+    // and release the session — not sit busy forever on a prompt that never
+    // landed (the old behaviour lost the item and wedged the session).
     const { data: state } = await api(`/status?session=${session}`);
-    expect(state.status).toBe("busy");
-    expect(state.currentTaskId).toBe("drain-next");
+    expect(state.status).toBe("offline"); // no tmux -> released to offline
+    expect(state.currentTaskId).toBeUndefined();
 
-    // Queue should be empty now
+    // The item is back at the head of the queue, not lost.
     const { data: queue } = await api(`/queue?session=${session}`);
-    expect(queue.length).toBe(0);
+    expect(queue.length).toBe(1);
+    expect(queue.items[0].id).toBe("drain-next");
   });
 });
 

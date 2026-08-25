@@ -484,6 +484,9 @@ async function deliverToSubscribers(
     if (where === "sent") {
       log("info", "pipeline_dispatched", { topic, subscriber: subscriberSession, taskId });
       if (eventId) await eventBus.recordDelivery(eventId, subscriberSession, "session", "delivered");
+    } else if (where === "failed") {
+      log("error", "pipeline_dispatch_failed", { topic, subscriber: subscriberSession, taskId });
+      if (eventId) await eventBus.recordDelivery(eventId, subscriberSession, "session", "failed");
     } else {
       log(where === "queued_offline" ? "warn" : "info",
         where === "queued_offline" ? "pipeline_subscriber_offline" : "pipeline_queued",
@@ -1145,7 +1148,27 @@ function drainQueue(session: string) {
   });
   recordTaskStart({ id: next.id, session, prompt: next.prompt, source: next.source ?? "queue", chain: next.chain });
 
-  sendToTmux(session, next.prompt);
+  const sent = sendToTmux(session, next.prompt);
+  if (!sent) {
+    // The send failed (tmux died / TUI wedged) and the item was already
+    // spliced out. Put it back at the head of the queue and release the
+    // session — otherwise the member sits busy forever on a prompt that never
+    // landed and the rest of the queue starves behind it.
+    const tmuxAlive = isTmuxRunning(session);
+    recordTaskFinish({ id: next.id, session, status: "failed", error: "send to tmux failed" });
+    const requeue = readQueue(session);
+    requeue.unshift(next);
+    writeQueue(session, requeue);
+    writeState(session, {
+      status: tmuxAlive ? "idle" : "offline",
+      since: new Date().toISOString(),
+      currentPrompt: undefined, currentTaskId: undefined, currentChain: undefined,
+      currentDedupKey: undefined, currentCallbackUrl: undefined, currentEphemeral: undefined,
+      deadlineAt: undefined,
+    });
+    log("error", "queue_drain_failed", { session, taskId: next.id, tmuxRunning: tmuxAlive });
+    return;
+  }
   log("info", "queue_drained", { session, taskId: next.id, remaining: queue.length });
 }
 
@@ -1470,12 +1493,14 @@ const mapRuns = new Map<string, MapRun>();
 const taskToMap = new Map<string, { runId: string; index: number }>();
 
 // Send to a session if idle, else queue it. Used by pool dispatch and the
-// reducer. Returns where the work landed.
+// reducer. Returns where the work landed — "failed" means the send itself
+// failed (tmux gone / TUI wedged) and the session was released again, so the
+// caller can surface the error instead of reporting work as dispatched.
 function dispatchOrQueue(
   session: string,
   prompt: string,
   opts: { id: string; source?: string; chain?: string[]; priority?: number }
-): "sent" | "queued" | "queued_offline" {
+): "sent" | "queued" | "queued_offline" | "failed" {
   const state = readState(session);
 
   if (state.status === "idle") {
@@ -1485,7 +1510,22 @@ function dispatchOrQueue(
       deadlineAt: taskDeadline(),
     });
     recordTaskStart({ id: opts.id, session, prompt, source: opts.source, chain: opts.chain });
-    sendToTmux(session, prompt);
+    const sent = sendToTmux(session, prompt);
+    if (!sent) {
+      // The prompt never landed, so the Stop hook will never fire: leaving the
+      // session busy here would wedge it (and its queue) forever. Same failure
+      // path as /trigger — record the failed task and release the session.
+      const tmuxAlive = isTmuxRunning(session);
+      recordTaskFinish({ id: opts.id, session, status: "failed", error: "send to tmux failed" });
+      writeState(session, {
+        status: tmuxAlive ? "idle" : "offline",
+        since: new Date().toISOString(),
+        currentPrompt: undefined, currentTaskId: undefined, currentChain: undefined,
+        deadlineAt: undefined,
+      });
+      log("error", "dispatch_failed", { session, taskId: opts.id, tmuxRunning: tmuxAlive });
+      return "failed";
+    }
     return "sent";
   }
 
@@ -1497,19 +1537,43 @@ function dispatchOrQueue(
 
 // Pick the member to hand the next item to: an idle one if any, otherwise the
 // one with the shortest queue (least loaded). Synchronous, so within one event
-// loop turn two dispatches can't claim the same idle member.
-function pickPoolMember(members: string[]): { session: string; idle: boolean } | null {
+// loop turn two dispatches can't claim the same idle member. When EVERY member
+// is offline it returns the first offline member flagged `offline`, so the
+// caller can auto-start it — silently queueing on a stopped session used to be
+// a dead end nothing would ever drain.
+function pickPoolMember(members: string[]): { session: string; idle: boolean; offline?: boolean } | null {
   let leastLoaded: { session: string; load: number } | null = null;
+  let firstOffline: string | null = null;
   for (const m of members) {
     const state = readState(m);
     if (state.status === "idle") return { session: m, idle: true };
-    if (state.status === "offline") continue;
+    if (state.status === "offline") {
+      if (firstOffline === null) firstOffline = m;
+      continue;
+    }
     const load = state.queueLength;
     if (!leastLoaded || load < leastLoaded.load) leastLoaded = { session: m, load };
   }
   if (leastLoaded) return { session: leastLoaded.session, idle: false };
-  // Everyone offline — fall back to the first member so the work queues somewhere.
-  return members.length > 0 ? { session: members[0]!, idle: false } : null;
+  return firstOffline !== null ? { session: firstOffline, idle: false, offline: true } : null;
+}
+
+// Bring an offline pool member back up so dispatched work has somewhere to run.
+// Reuses the cwd and model the member last ran with (falling back to the
+// server's cwd policy), the same contract as /session/start. Callers treat a
+// failure as a loud 503 — the alternative is work queued where nobody runs it.
+async function ensurePoolMemberStarted(session: string): Promise<{ success: boolean; error?: string }> {
+  const state = readState(session);
+  if (state.status !== "offline") return { success: true };
+  const { cwd, error } = resolveStartCwd(state.cwd);
+  if (error) return { success: false, error };
+  const started = await startClaudeSession(session, cwd!, state.model ?? null);
+  if (!started.success) {
+    log("error", "pool_member_autostart_failed", { session, error: started.error });
+    return { success: false, error: started.error };
+  }
+  log("info", "pool_member_autostarted", { session });
+  return { success: true };
 }
 
 function formatMapResults(run: MapRun): string {
@@ -1561,7 +1625,10 @@ function finishMapRun(run: MapRun, partial: boolean) {
   }
   const reduceTaskId = generateId();
   run.reduceTaskId = reduceTaskId;
-  dispatchOrQueue(run.reduce.session, prompt, { id: reduceTaskId, source: `map:${run.runId}` });
+  const where = dispatchOrQueue(run.reduce.session, prompt, { id: reduceTaskId, source: `map:${run.runId}` });
+  if (where === "failed") {
+    log("error", "map_reduce_dispatch_failed", { runId: run.runId, session: run.reduce.session, taskId: reduceTaskId });
+  }
 }
 
 // --- Claude Code account auth (W1.1, redesigned W1.6) ------------------------
@@ -1976,7 +2043,18 @@ const server = Bun.serve({
         const sent = sendToTmux(session, prompt);
         if (!sent) {
           recordTaskFinish({ id, session, status: "failed", error: "send to tmux failed" });
-          log("error", "trigger_failed", { session, taskId: id });
+          // Release the session again: the Stop hook never fires for a prompt
+          // that never landed, and the busy state written above would
+          // otherwise wedge this session (and its queue) forever.
+          const tmuxAlive = isTmuxRunning(session);
+          writeState(session, {
+            status: tmuxAlive ? "idle" : "offline",
+            since: new Date().toISOString(),
+            currentPrompt: undefined, currentTaskId: undefined, currentChain: undefined,
+            currentDedupKey: undefined, currentCallbackUrl: undefined, currentEphemeral: undefined,
+            deadlineAt: undefined,
+          });
+          log("error", "trigger_failed", { session, taskId: id, tmuxRunning: tmuxAlive });
           return Response.json({ error: "Failed to send to tmux session" }, { status: 500 });
         }
 
@@ -2037,7 +2115,9 @@ const server = Bun.serve({
     // --- Worker pools & map-reduce ---
 
     // Load-balance one prompt across a pool's members (idle first, else the
-    // least-loaded member's queue).
+    // least-loaded member's queue). If every member is offline the picked
+    // member is auto-started first; a member that can't start fails the
+    // request with 503 instead of queueing into a dead end.
     "/pool/:name/trigger": {
       POST: authed(async (req) => {
         const name = sanitizeSession(req.params.name);
@@ -2055,11 +2135,26 @@ const server = Bun.serve({
         const member = pickPoolMember(pool.members);
         if (!member) return Response.json({ error: "Pool has no members" }, { status: 503 });
 
+        // All members offline: bring the picked one back up instead of queueing
+        // work nothing would ever run. If it can't start, fail loudly.
+        if (member.offline) {
+          const started = await ensurePoolMemberStarted(member.session);
+          if (!started.success) {
+            return Response.json({
+              error: `Pool member '${member.session}' is offline and could not be auto-started: ${started.error}`,
+              pool: name, member: member.session,
+            }, { status: 503 });
+          }
+        }
+
         const id = body.id ? sanitizeId(body.id as string) : generateId();
         const where = dispatchOrQueue(member.session, prompt, {
           id, source: (body.source as string) ?? `pool:${name}`,
           priority: Number(body.priority) || undefined,
         });
+        if (where === "failed") {
+          return Response.json({ error: "Failed to send to pool member (tmux unavailable)", pool: name, member: member.session, id }, { status: 500 });
+        }
         log("info", "pool_dispatched", { pool: name, member: member.session, taskId: id, where });
         return Response.json({ pool: name, member: member.session, id, where });
       }),
@@ -2098,11 +2193,27 @@ const server = Bun.serve({
           const v = validateStructural(prompt);
           if (!v.ok) { run.collected[i] = `(skipped: ${v.reason})`; continue; }
 
+          const member = pickPoolMember(pool.members)!;
+          // All members offline: auto-start the picked one. If it can't start,
+          // fail THIS shard loudly in the reduce instead of dispatching into a
+          // queue nothing drains.
+          if (member.offline) {
+            const started = await ensurePoolMemberStarted(member.session);
+            if (!started.success) {
+              run.collected[i] = `(skipped: member '${member.session}' is offline and auto-start failed)`;
+              continue;
+            }
+          }
+
           const taskId = generateId();
           taskToMap.set(taskId, { runId, index: i });
           run.shardTaskIds.push(taskId);
-          const member = pickPoolMember(pool.members)!;
           const where = dispatchOrQueue(member.session, prompt, { id: taskId, source: `map:${runId}` });
+          if (where === "failed") {
+            taskToMap.delete(taskId);
+            run.collected[i] = "(failed: send to tmux failed)";
+            continue;
+          }
           dispatched.push({ index: i, taskId, member: member.session, where });
         }
 
@@ -2195,6 +2306,7 @@ const server = Bun.serve({
         const session = sanitizeSession(recipe.session ?? "default");
         const id = generateId();
         const where = dispatchOrQueue(session, prompt, { id, source: `ingest:${source}` });
+        if (where === "failed") log("error", "ingest_dispatch_failed", { source, session, taskId: id });
         log("info", "ingest_triggered", { source, session, taskId: id, where });
         return Response.json({ ingested: true, source, target: "trigger", session, id, where });
       },
@@ -3147,10 +3259,41 @@ const delayTickTimer = setInterval(() => {
 // the Notification hook) or past their hard deadline, so a stuck session can't
 // silently sit busy forever and starve its queue. Recovery (Escape + drain) is
 // opt-in via HAIFLOW_WATCHDOG_RECOVER; by default this only alerts in the logs.
+// One exception is always recovered: a busy session whose tmux is GONE can
+// never fire the Stop hook, so it is transitioned to offline and its orphaned
+// task requeued regardless of the opt-in — that's state hygiene, not recovery.
 const watchdogTimer = setInterval(() => {
   for (const { session, status } of listSessions()) {
     if (status !== "busy") continue;
     const state = readState(session);
+
+    if (!isTmuxRunning(session)) {
+      log("warn", "watchdog_dead_tmux", { session, taskId: state.currentTaskId });
+      if (state.currentTaskId) {
+        // The task in flight is an orphan: no pane exists for it to finish in.
+        // Put it back at the head of the queue so it is the first thing picked
+        // up when the session comes back, and close the ledger row as failed.
+        const queue = readQueue(session);
+        queue.unshift({
+          id: state.currentTaskId, prompt: state.currentPrompt ?? "", addedAt: state.since,
+          chain: state.currentChain, dedupKey: state.currentDedupKey,
+          callbackUrl: state.currentCallbackUrl, ephemeral: state.currentEphemeral,
+        });
+        writeQueue(session, queue);
+        recordTaskFinish({ id: state.currentTaskId, session, status: "failed", error: "watchdog:tmux_died" });
+      }
+      writeState(session, {
+        status: "offline", since: new Date().toISOString(),
+        currentPrompt: undefined, currentTaskId: undefined, currentChain: undefined,
+        currentDedupKey: undefined, currentCallbackUrl: undefined, currentEphemeral: undefined,
+        waiting: false, waitingMessage: undefined, waitingSince: undefined, deadlineAt: undefined,
+      });
+      log("info", "watchdog_recovered", {
+        session, reason: "tmux_died", taskId: state.currentTaskId, requeued: !!state.currentTaskId,
+      });
+      continue;
+    }
+
     const now = Date.now();
     const overDeadline = state.deadlineAt ? Date.parse(state.deadlineAt) < now : false;
     const waitingTooLong = state.waiting && state.waitingSince
@@ -3164,7 +3307,7 @@ const watchdogTimer = setInterval(() => {
       waitingMessage: state.waitingMessage, recover: WATCHDOG_RECOVER,
     });
 
-    if (!WATCHDOG_RECOVER || !isTmuxRunning(session)) continue;
+    if (!WATCHDOG_RECOVER) continue;
 
     sendInterrupt(session, "escape");
     if (state.currentTaskId) {

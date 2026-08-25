@@ -177,7 +177,7 @@ cp .env.example .env
 | `HAIFLOW_USAGE_ALERT_TOKENS` | — | When set, `GET /usage/window` flags `alert: true` once the rolling 5h token total crosses it (alert-only, never throttles) |
 | `HAIFLOW_TASK_TIMEOUT_SEC` | `0` | Optional hard per-task timeout. `0` disables it. The watchdog flags tasks that exceed it |
 | `HAIFLOW_WAITING_GRACE_SEC` | `120` | How long a session flagged `waiting` by Claude's Notification hook may stay blocked before the watchdog acts |
-| `HAIFLOW_WATCHDOG_RECOVER` | `false` | When `true`, the watchdog auto-recovers a wedged session (Escape, mark `timed_out`, drain). Default alert-only |
+| `HAIFLOW_WATCHDOG_RECOVER` | `false` | When `true`, the watchdog auto-recovers a wedged-but-alive session (Escape, mark `timed_out`, drain). Default alert-only. One case always recovers regardless of this flag: a busy session whose tmux died is marked `offline` and its orphaned task requeued, since it can never finish on its own |
 | `HAIFLOW_MAP_MAX_ITEMS` | `200` | Max items one `POST /map` call may fan across a pool |
 | `HAIFLOW_MAP_TIMEOUT_SEC` | `1800` | How long a map run waits for stragglers before the reducer fires with partial results |
 
@@ -257,7 +257,7 @@ Haiflow outputs structured JSON logs to stdout/stderr for all key events:
 {"ts":"2026-03-18T02:35:10Z","level":"warn","event":"auth_rejected","path":"/trigger"}
 ```
 
-Events: `server_started`, `sessions_recovered`, `stale_prompts_swept`, `sessions_pruned`, `session_started`, `session_start_cwd_defaulted`, `session_stopped`, `session_start_failed`, `session_start_workspace_trust_required`, `session_start_workspace_trust_auto_accepted`, `session_start_onboarding_prompt_dismissed`, `trigger_sent`, `trigger_queued`, `trigger_deduped`, `trigger_failed`, `queue_drained`, `queue_cleared`, `queue_item_removed`, `queue_item_reprioritized`, `task_cancelled`, `response_saved`, `stream_opened`, `hook_session_start`, `hook_message_display`, `hook_stop`, `hook_session_end`, `hook_notification`, `interrupt_sent`, `watchdog_triggered`, `watchdog_recovered`, `auth_rejected`, `redis_connected`, `redis_disconnected`, `redis_unavailable`, `event_published`, `event_published_direct`, `pipeline_dispatched`, `pipeline_queued`, `pipeline_subscriber_offline`, `pipeline_circular_skipped`, `pipeline_prompt_too_large`, `pipeline_webhook_sent`, `pipeline_webhook_failed`, `publish_unknown_topic`, `publish_unauthorized`, `pool_dispatched`, `map_started`, `map_progress`, `map_reduced`, `map_reduced_partial`, `ingest_triggered`, `ingest_published`, `ingest_rejected`, `ingest_replay`, `ingest_replay_unavailable`, `shutdown`, `unhandled_rejection`, `uncaught_exception`.
+Events: `server_started`, `sessions_recovered`, `stale_prompts_swept`, `sessions_pruned`, `session_started`, `session_start_cwd_defaulted`, `session_stopped`, `session_start_failed`, `session_start_workspace_trust_required`, `session_start_workspace_trust_auto_accepted`, `session_start_onboarding_prompt_dismissed`, `trigger_sent`, `trigger_queued`, `trigger_deduped`, `trigger_failed`, `dispatch_failed`, `queue_drained`, `queue_drain_failed`, `queue_cleared`, `queue_item_removed`, `queue_item_reprioritized`, `task_cancelled`, `response_saved`, `stream_opened`, `hook_session_start`, `hook_message_display`, `hook_stop`, `hook_session_end`, `hook_notification`, `interrupt_sent`, `watchdog_triggered`, `watchdog_dead_tmux`, `watchdog_recovered`, `auth_rejected`, `redis_connected`, `redis_disconnected`, `redis_unavailable`, `event_published`, `event_published_direct`, `pipeline_dispatched`, `pipeline_dispatch_failed`, `pipeline_queued`, `pipeline_subscriber_offline`, `pipeline_circular_skipped`, `pipeline_prompt_too_large`, `pipeline_webhook_sent`, `pipeline_webhook_failed`, `publish_unknown_topic`, `publish_unauthorized`, `pool_dispatched`, `pool_member_autostarted`, `pool_member_autostart_failed`, `map_started`, `map_progress`, `map_reduced`, `map_reduced_partial`, `map_reduce_dispatch_failed`, `ingest_triggered`, `ingest_dispatch_failed`, `ingest_published`, `ingest_rejected`, `ingest_replay`, `ingest_replay_unavailable`, `shutdown`, `unhandled_rejection`, `uncaught_exception`.
 
 ## How it works
 
@@ -326,6 +326,12 @@ Define a pool of member sessions in `pipeline.json` and haiflow load-balances wo
 ```json
 { "pools": { "reviewers": { "members": ["reviewer-1", "reviewer-2", "reviewer-3"] } } }
 ```
+
+The pool is built to fail loud instead of stalling silently:
+
+- **Offline members are auto-started.** When every member is offline, dispatch brings the picked member back up with the cwd/model it last ran with (the same contract as `POST /session/start`). If it can't start, the request fails with `503` — work is never queued onto a stopped session where nothing would ever run it.
+- **A failed send frees the member.** If the prompt can't be delivered (tmux gone, TUI wedged), the task is recorded `failed` and the member is released (`idle` when tmux still runs, `offline` when it doesn't) — `/pool/:name/trigger` answers `500`, `/map` marks the shard failed in the reduce. The member never sits `busy` on a prompt that never landed.
+- **Dead tmux is recovered by the watchdog.** A busy member whose tmux session died can never fire its Stop hook, so the watchdog marks it `offline` and requeues the orphaned task even when `HAIFLOW_WATCHDOG_RECOVER` is off (see below).
 
 ## Pipeline
 
