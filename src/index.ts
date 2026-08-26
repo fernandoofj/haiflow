@@ -88,6 +88,11 @@ function resolveStartCwd(
 }
 const ENABLE_GUARDRAILS = (process.env.HAIFLOW_GUARDRAILS ?? "true").toLowerCase() !== "false";
 const GUARDRAIL_SKILL_NAME = "haiflow-guardrails";
+// The line that tells an installed SKILL.md apart from one somebody wrote by
+// hand. Any copy carrying it is ours and may be replaced; one without it either
+// predates this marker or was edited locally, and gets moved aside instead of
+// being thrown away.
+const GUARDRAIL_GENERATED_MARKER = "<!-- generated-by: haiflow";
 const AUTO_ACCEPT_WORKSPACE_TRUST =
   (process.env.HAIFLOW_AUTO_ACCEPT_WORKSPACE_TRUST ?? "false").toLowerCase() === "true";
 // How long /session/start waits for the SessionStart hook to link a Claude
@@ -1207,9 +1212,45 @@ function installGuardrailSkill(): void {
   const targetDir = `${home}/.claude/skills/${GUARDRAIL_SKILL_NAME}`;
   const targetPath = `${targetDir}/SKILL.md`;
   try {
+    // Already exactly what we would write: leave the file alone. Rewriting it
+    // would bump the mtime on every boot for no change, which is the kind of
+    // noise that trains people to ignore a diff.
+    let existing: string | null = null;
+    try {
+      existing = readFileSync(targetPath, "utf8");
+    } catch {
+      // Not there yet (or unreadable) — treat as a fresh install.
+    }
+    if (existing === content) {
+      log("info", "guardrail_skill_unchanged", { path: targetPath });
+      return;
+    }
+
     mkdirSync(targetDir, { recursive: true });
+
+    // Someone's own file is under our path. Overwriting it in silence is the
+    // part that was wrong here: the edit would stop taking effect at the next
+    // restart and nothing would say so. Move it aside and say where it went.
+    if (existing !== null && !existing.includes(GUARDRAIL_GENERATED_MARKER)) {
+      const backupPath = `${targetPath}.bak`;
+      try {
+        writeFileSync(backupPath, existing);
+        log("warn", "guardrail_skill_backed_up", {
+          path: targetPath, backup: backupPath,
+          reason: "existing SKILL.md was not installed by haiflow; edit src/skills/haiflow-guardrails.md instead",
+        });
+      } catch (err) {
+        // Could not preserve it — then do not destroy it either.
+        log("warn", "guardrail_install_skipped", {
+          path: targetPath, error: String(err),
+          reason: "refusing to overwrite a hand-edited SKILL.md that could not be backed up",
+        });
+        return;
+      }
+    }
+
     writeFileSync(targetPath, content);
-    log("info", "guardrail_skill_installed", { path: targetPath });
+    log("info", "guardrail_skill_installed", { path: targetPath, replaced: existing !== null });
   } catch (err) {
     log("warn", "guardrail_install_failed", { path: targetPath, error: String(err) });
   }

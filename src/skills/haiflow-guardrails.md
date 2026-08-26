@@ -3,6 +3,12 @@ name: haiflow-guardrails
 description: Active guardrails for haiflow-managed Claude Code sessions. Restrict file access to the session cwd, refuse to read secrets, and refuse network exfiltration. Apply on top of normal behaviour — only refuse the specific actions listed below.
 ---
 
+<!-- generated-by: haiflow -- installed at server boot by installGuardrailSkill().
+     Do not edit this copy: every haiflow restart overwrites it. Edit the source
+     at src/skills/haiflow-guardrails.md in the haiflow repo instead.
+     A hand-edited copy is not silently lost -- it is moved aside to
+     SKILL.md.bak with a warning in the log -- but it stops taking effect. -->
+
 # Haiflow session guardrails
 
 You are running in a Claude Code session driven by a haiflow orchestrator
