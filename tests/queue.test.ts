@@ -1,10 +1,19 @@
 import { test, expect, describe, beforeAll, afterAll } from "bun:test";
-import { mkdirSync, writeFileSync, existsSync, rmSync } from "fs";
+import { mkdirSync, writeFileSync, existsSync, rmSync, chmodSync } from "fs";
+import { join } from "path";
 
 const TEST_PORT = 9882;
 const TEST_DIR = "/tmp/haiflow-queue-test";
 const TEST_API_KEY = "test-api-key";
 const BASE = `http://localhost:${TEST_PORT}`;
+const BIN_DIR = "/tmp/haiflow-queue-bin";
+const PATH_SEP = process.platform === "win32" ? ";" : ":";
+
+// Drain dispatches for real, so the server's PATH carries the fake `tmux`
+// (tests/fixtures/fake-tmux.ts): healthy sessions accept sends, sessions named
+// `gone*` report a dead tmux — which is how the drain-failure test below
+// simulates a member whose pane died mid-queue.
+const FAKE_TMUX = join(import.meta.dir, "fixtures", "fake-tmux.ts");
 
 let server: ReturnType<typeof Bun.spawn>;
 const authHeaders: Record<string, string> = { Authorization: `Bearer ${TEST_API_KEY}` };
@@ -31,8 +40,20 @@ function seedBusy(session: string, taskId = "current"): string {
 
 beforeAll(async () => {
   if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+  if (existsSync(BIN_DIR)) rmSync(BIN_DIR, { recursive: true, force: true });
+  mkdirSync(BIN_DIR, { recursive: true });
+  // POSIX shim + Windows shim, both exec'ing the fake with the absolute bun path.
+  writeFileSync(join(BIN_DIR, "tmux"), `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(FAKE_TMUX)} "$@"\n`);
+  chmodSync(join(BIN_DIR, "tmux"), 0o755);
+  if (process.platform === "win32") {
+    writeFileSync(join(BIN_DIR, "tmux.cmd"), `@echo off\r\n${JSON.stringify(process.execPath)} ${JSON.stringify(FAKE_TMUX)} %*\r\n`);
+  }
   server = Bun.spawn(["bun", "run", "src/index.ts"], {
-    env: { ...process.env, PORT: String(TEST_PORT), HAIFLOW_DATA_DIR: TEST_DIR, HAIFLOW_API_KEY: TEST_API_KEY, HAIFLOW_GUARDRAILS: "false" },
+    env: {
+      ...process.env,
+      PATH: `${BIN_DIR}${PATH_SEP}${process.env.PATH}`,
+      PORT: String(TEST_PORT), HAIFLOW_DATA_DIR: TEST_DIR, HAIFLOW_API_KEY: TEST_API_KEY, HAIFLOW_GUARDRAILS: "false",
+    },
     stdout: "ignore", stderr: "ignore",
   });
   for (let i = 0; i < 150; i++) {
@@ -45,6 +66,7 @@ beforeAll(async () => {
 afterAll(() => {
   server?.kill();
   if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+  if (existsSync(BIN_DIR)) rmSync(BIN_DIR, { recursive: true, force: true });
 });
 
 describe("smart queue", () => {
@@ -116,5 +138,29 @@ describe("smart queue", () => {
     expect(status.data.status).toBe("idle");
     const queue = await api(`/queue?session=${session}`);
     expect(queue.data.length).toBe(1); // not drained
+  });
+
+  test("a failed drain requeues the item and releases the member", async () => {
+    // gone-q's tmux is "dead" (fake-tmux `gone` prefix), so the drain's send
+    // fails. The item must come back to the head of the queue and the session
+    // must be released — the old behaviour lost the item and sat busy forever
+    // on a prompt that never landed.
+    const session = "gone-q";
+    const dir = `${TEST_DIR}/${session}`;
+    mkdirSync(`${dir}/responses`, { recursive: true });
+    writeFileSync(`${dir}/session-id`, `claude-${session}`);
+    writeFileSync(`${dir}/state.json`, JSON.stringify({ status: "busy", since: new Date().toISOString(), currentTaskId: "cur-1" }));
+    writeFileSync(`${dir}/queue.json`, JSON.stringify([
+      { id: "q-next", prompt: "next prompt", addedAt: "2025-01-01T00:00:00Z" },
+    ]));
+
+    await api("/hooks/stop", "POST", { session_id: `claude-${session}`, last_assistant_message: "done" });
+
+    const status = await api(`/status?session=${session}`);
+    expect(status.data.status).toBe("offline"); // tmux gone -> released, not busy
+    expect(status.data.currentTaskId).toBeUndefined();
+    const queue = await api(`/queue?session=${session}`);
+    expect(queue.data.length).toBe(1);
+    expect(queue.data.items[0].id).toBe("q-next");
   });
 });
