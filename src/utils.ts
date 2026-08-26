@@ -1,4 +1,4 @@
-import { resolve } from "path";
+import { resolve, relative, isAbsolute, sep } from "path";
 import { realpathSync, statSync } from "fs";
 
 // --- Input sanitization ---
@@ -80,10 +80,27 @@ export function validateStructural(prompt: string): { ok: boolean; reason?: stri
 
 // --- Transcript path validation ---
 
+// resolve() both, so each prefix is already in the platform's own shape before
+// anything is compared. The literal "/tmp/claude" used to be compared raw, and
+// on Windows resolve() turns a candidate into "C:\tmp\claude\..." -- which never
+// starts with "/tmp/claude/". Every transcript was silently rejected there, and
+// the Stop hook fell back to "(no text output)" instead of the real answer.
 const TRANSCRIPT_PREFIXES = [
   resolve(process.env.HOME ?? "/", ".claude"),
-  "/tmp/claude",
+  resolve("/tmp/claude"),
 ];
+
+// Is `child` strictly inside `parent`? relative() does the containment test in
+// the platform's own separator, so this works the same on POSIX and Windows
+// (where it is also case-insensitive, as the filesystem is).
+//
+// The rejections the allowlist depends on all survive: the prefix directory
+// itself relativises to "" (empty), an escape to ".." or "../…", a sibling like
+// /tmp/claudeX to "../claudeX", and an unrelated root to an absolute path.
+function isInside(parent: string, child: string): boolean {
+  const rel = relative(parent, child);
+  return rel !== "" && !isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`);
+}
 
 export function isAllowedTranscriptPath(p: string): boolean {
   const resolved = resolve(p);
@@ -101,11 +118,11 @@ export function isAllowedTranscriptPath(p: string): boolean {
     // not-yet-written transcript under an allowed prefix is still permitted.
   }
   return TRANSCRIPT_PREFIXES.some((prefix) => {
-    if (candidate.startsWith(prefix + "/")) return true;
+    if (isInside(prefix, candidate)) return true;
     // The prefix itself may be a symlink (e.g. macOS /tmp -> /private/tmp), so
     // also compare against its real path when it exists.
     try {
-      return candidate.startsWith(realpathSync(prefix) + "/");
+      return isInside(realpathSync(prefix), candidate);
     } catch {
       return false;
     }
