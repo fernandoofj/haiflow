@@ -1,9 +1,25 @@
 import { test, expect, describe, beforeAll, afterAll, beforeEach } from "bun:test";
 import { mkdirSync, writeFileSync, existsSync, rmSync, unlinkSync } from "fs";
-import { resolve } from "path";
+import { resolve, join, delimiter } from "path";
 
 // Absolute entry so the server can be spawned from a neutral cwd.
 const SERVER_ENTRY = resolve(import.meta.dir, "../src/index.ts");
+
+// PATH with every directory that carries a `claude` executable removed. The
+// server's fast-fail guard is `Bun.which("claude")`, so this is what makes
+// "the CLI is absent" true on demand instead of only on a machine that happens
+// not to have Claude Code installed.
+//
+// It also keeps this suite honest in the other direction: with a real `claude`
+// reachable, /session/start here would launch the actual CLI in a real tmux
+// pane. No test may spawn that.
+function pathWithoutClaude(): string {
+  const exts = process.platform === "win32" ? ["", ".exe", ".cmd", ".bat", ".com"] : [""];
+  return (process.env.PATH ?? "")
+    .split(delimiter)
+    .filter((dir) => dir && !exts.some((ext) => existsSync(join(dir, `claude${ext}`))))
+    .join(delimiter);
+}
 
 const TEST_PORT = 9876;
 const TEST_DIR = "/tmp/haiflow-test";
@@ -44,14 +60,19 @@ function writeResponse(session: string, taskId: string, data: object) {
 beforeAll(async () => {
   if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
 
-  server = Bun.spawn(["bun", "run", SERVER_ENTRY], {
+  // Spawn the entry with the running bun binary rather than `bun run <entry>`:
+  // `bun run` interposes a launcher process, and killing that launcher leaves
+  // the actual server alive holding TEST_DIR open. On Windows that turns every
+  // afterAll cleanup into EBUSY; everywhere it leaks a listening port into the
+  // next run. Spawned this way, the process we hold IS the server.
+  server = Bun.spawn([process.execPath, SERVER_ENTRY], {
     // Neutral cwd so the cwd-optional /session/start fallback resolves to /tmp
     // (a fast-failing dir in tests) instead of the repo root.
     cwd: "/tmp",
     // Run from a neutral dir and bound the readiness wait so a real /session/start
-    // can't hang the suite (200 if it links fast, otherwise 409); guardrails off.
+    // can't hang the suite (409 without the CLI); guardrails off.
     // The omitted-cwd fallback is the fixed DEFAULT_CWD = "/tmp" regardless of this.
-    env: { ...process.env, PORT: String(TEST_PORT), HAIFLOW_DATA_DIR: TEST_DIR, HAIFLOW_API_KEY: TEST_API_KEY, HAIFLOW_START_READY_TIMEOUT_MS: "2000", HAIFLOW_GUARDRAILS: "false" },
+    env: { ...process.env, PATH: pathWithoutClaude(), PORT: String(TEST_PORT), HAIFLOW_DATA_DIR: TEST_DIR, HAIFLOW_API_KEY: TEST_API_KEY, HAIFLOW_START_READY_TIMEOUT_MS: "2000", HAIFLOW_GUARDRAILS: "false" },
     stdout: "ignore",
     stderr: "ignore",
   });
@@ -66,9 +87,13 @@ beforeAll(async () => {
   throw new Error("Server failed to start");
 });
 
-afterAll(() => {
+afterAll(async () => {
   server?.kill();
-  if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+  // Wait for the process to really be gone before deleting its data dir: while
+  // it lives it holds an open handle on TEST_DIR, and Windows answers rm with
+  // EBUSY. The retries cover the short window where the handle outlives exit.
+  await server?.exited;
+  if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true, maxRetries: 20, retryDelay: 100 });
 });
 
 // --- Health ---
@@ -136,10 +161,13 @@ describe("POST /session/start", () => {
     expect(status).toBeOneOf([200, 409]);
   });
 
-  // Runs only where the Claude CLI is absent (e.g. CI). Locks in the fast-fail:
-  // without this guard /session/start hangs ~45s on the readiness/guardrail
-  // waits instead of returning a clear error.
-  test.skipIf(!!Bun.which("claude"))("fails fast with 409 when the claude CLI is absent", async () => {
+  // Locks in the fast-fail: without the guard, /session/start hangs ~45s on the
+  // readiness/guardrail waits instead of returning a clear error. This used to
+  // skip wherever Claude Code was installed — i.e. on every developer machine,
+  // leaving the guard proven only by CI. The server for this suite now runs on
+  // a PATH with `claude` stripped (see pathWithoutClaude), so the condition the
+  // test needs is created rather than waited for.
+  test("fails fast with 409 when the claude CLI is absent", async () => {
     const { status, data } = await api("/session/start", "POST", { session: "no-claude", cwd: "/tmp" });
     expect(status).toBe(409);
     expect(data.error).toContain("claude");
