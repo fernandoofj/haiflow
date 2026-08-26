@@ -1,5 +1,5 @@
 import { test, expect, describe } from "bun:test";
-import { mkdirSync, writeFileSync, symlinkSync, unlinkSync, rmSync } from "fs";
+import { mkdirSync, writeFileSync, symlinkSync, unlinkSync, rmSync, realpathSync } from "fs";
 import { randomUUID } from "crypto";
 import {
   MAX_SESSION_NAME,
@@ -10,6 +10,71 @@ import {
   isAllowedTranscriptPath,
   renderTemplate,
 } from "../src/utils";
+
+// --- Planting a link that escapes the transcript allowlist ---
+//
+// isAllowedTranscriptPath defeats a link planted under an allowed prefix whose
+// real target lies outside it (/tmp is world-writable, so this is the attack).
+// Proving it needs an actual escaping link, and WHICH kind of link an
+// unprivileged process may create is an OS/user question — so measure it once
+// instead of assuming:
+//
+//   symlink  — the real thing. On Windows it needs SeCreateSymbolicLinkPrivilege
+//              (admin, or Developer Mode). Without it symlinkSync throws EPERM,
+//              which is why this test used to fail red on every run on a plain
+//              Windows box — a permanent red that taught nobody anything.
+//   junction — a Windows reparse point, for DIRECTORIES, and it needs NO
+//              privilege. realpathSync follows it out of the prefix exactly as
+//              it follows a symlink, so the property under test is unchanged:
+//              the resolved target lands outside the allowlist and the check
+//              must say no.
+//
+// A hardlink was the other candidate and does NOT work: it has no target to
+// resolve, realpath returns the link's own path inside the prefix, and nothing
+// escapes — it would assert the opposite of what we mean.
+const LINK_KIND: "symlink" | "junction" | null = (() => {
+  const probe = `/tmp/haiflow-linkprobe-${process.pid}`;
+  const rm = (p: string) => { try { rmSync(p, { recursive: true, force: true }); } catch {} };
+  try {
+    mkdirSync(`${probe}/target`, { recursive: true });
+    writeFileSync(`${probe}/target/file.txt`, "x");
+    try {
+      symlinkSync(`${probe}/target/file.txt`, `${probe}/as-symlink`);
+      return "symlink";
+    } catch {}
+    try {
+      symlinkSync(`${probe}/target`, `${probe}/as-junction`, "junction");
+      return "junction";
+    } catch {}
+    return null;
+  } catch {
+    return null;
+  } finally {
+    rm(probe);
+  }
+})();
+
+// Plant an escaping link under /tmp/claude using whichever kind LINK_KIND found,
+// and hand back the link path, the outside target it must resolve to, and a
+// cleanup. Only called from a test gated on LINK_KIND.
+function plantEscapingLink(id: string): { path: string; target: string; cleanup: () => void } {
+  const rm = (p: string) => { try { rmSync(p, { recursive: true, force: true }); } catch {} };
+  if (LINK_KIND === "symlink") {
+    const target = `/tmp/haiflow-symlink-target-${id}.txt`;
+    const link = `/tmp/claude/evil-${id}.jsonl`;
+    writeFileSync(target, "secret");
+    symlinkSync(target, link);
+    return { path: link, target, cleanup: () => { rm(link); rm(target); } };
+  }
+  // Junctions point at a directory, so the secret moves into one.
+  const targetDir = `/tmp/haiflow-junction-target-${id}`;
+  const target = `${targetDir}/transcript.jsonl`;
+  const junction = `/tmp/claude/evildir-${id}`;
+  mkdirSync(targetDir, { recursive: true });
+  writeFileSync(target, "secret");
+  symlinkSync(targetDir, junction, "junction");
+  return { path: `${junction}/transcript.jsonl`, target, cleanup: () => { rm(junction); rm(targetDir); } };
+}
 
 // --- Input sanitization ---
 
@@ -163,25 +228,37 @@ describe("security", () => {
       expect(isAllowedTranscriptPath("/tmp/claude")).toBe(false);
     });
 
-    test("follows symlinks: allows a real file but rejects one escaping the allowlist", () => {
+    test("allows a real regular file under the prefix", () => {
       const id = randomUUID();
       mkdirSync("/tmp/claude", { recursive: true });
-      const outside = `/tmp/haiflow-symlink-target-${id}.txt`;
       const real = `/tmp/claude/real-${id}.jsonl`;
-      const evil = `/tmp/claude/evil-${id}.jsonl`;
-      writeFileSync(outside, "secret");
       writeFileSync(real, "{}");
-      symlinkSync(outside, evil);
       try {
-        // A real regular file under the prefix is allowed (also exercises the
-        // realpath'd-prefix match, e.g. macOS /tmp -> /private/tmp).
+        // Also exercises the realpath'd-prefix match (e.g. macOS /tmp -> /private/tmp).
         expect(isAllowedTranscriptPath(real)).toBe(true);
-        // A symlink under the prefix pointing outside it resolves out and is rejected.
-        expect(isAllowedTranscriptPath(evil)).toBe(false);
       } finally {
-        for (const f of [outside, real, evil]) { try { unlinkSync(f); } catch {} }
+        try { unlinkSync(real); } catch {}
       }
     });
+
+    test.skipIf(!LINK_KIND)(
+      `follows links (${LINK_KIND}): rejects one planted under the prefix that resolves outside`,
+      () => {
+        const id = randomUUID();
+        mkdirSync("/tmp/claude", { recursive: true });
+        const link = plantEscapingLink(id);
+        try {
+          const resolved = realpathSync(link.path);
+          // The link really does point out of the allowlist — so the rejection
+          // below is the policy talking, not a path that failed to resolve.
+          expect(resolved).toBe(realpathSync(link.target));
+          expect(resolved.startsWith(realpathSync("/tmp/claude"))).toBe(false);
+          expect(isAllowedTranscriptPath(link.path)).toBe(false);
+        } finally {
+          link.cleanup();
+        }
+      },
+    );
 
     test("rejects a directory under the prefix (must be a regular file)", () => {
       const id = randomUUID();
