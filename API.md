@@ -383,7 +383,26 @@ curl -X POST -H "Authorization: Bearer $HAIFLOW_API_KEY" -H "Content-Type: appli
   http://localhost:3333/pool/reviewers/trigger
 ```
 
-Returns `{ "pool": "reviewers", "member": "reviewer-2", "id": "task_...", "where": "sent" }`.
+Returns `{ "pool": "reviewers", "member": "reviewer-2", "id": "task_...", "where": "sent" }`,
+where `where` is `"sent"` (dispatched to an idle member) or `"queued"` (parked on the
+least-loaded member's queue).
+
+**Failures are now reported as errors, not as a 200.** An offline pool is auto-started
+on demand; when that cannot happen, the call fails loudly instead of parking the prompt
+where nothing would ever pick it up:
+
+| Status | When |
+|---|---|
+| `400` | Invalid/empty JSON body, or the prompt was rejected by the guardrails |
+| `404` | Unknown pool |
+| `413` | Prompt over the size limit |
+| `500` | The member was reachable but the send to its tmux failed |
+| `503` | The pool has no members, or the chosen member is offline and could not be auto-started (the response `error` says which) |
+
+A caller that only handled `2xx` and `404` used to see `200` with `where: "queued_offline"`
+in the last two rows. That reply was a dead end — nobody starts an offline member on its
+own, so the prompt sat in a queue that would never drain. It is gone: handle `500` and
+`503`.
 
 ### `POST /map`
 
