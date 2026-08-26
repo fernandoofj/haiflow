@@ -15,44 +15,60 @@ import {
 //
 // isAllowedTranscriptPath defeats a link planted under an allowed prefix whose
 // real target lies outside it (/tmp is world-writable, so this is the attack).
-// Proving it needs an actual escaping link, and WHICH kind of link an
-// unprivileged process may create is an OS/user question — so measure it once
-// instead of assuming:
+// Proving it needs an actual escaping link, and which kind this OS lets an
+// UNPRIVILEGED process create differs by platform:
 //
-//   symlink  — the real thing. On Windows it needs SeCreateSymbolicLinkPrivilege
-//              (admin, or Developer Mode). Without it symlinkSync throws EPERM,
-//              which is why this test used to fail red on every run on a plain
-//              Windows box — a permanent red that taught nobody anything.
+//   symlink  — the real thing, and free on POSIX. On Windows it needs
+//              SeCreateSymbolicLinkPrivilege (administrator), which is why this
+//              test used to fail red on every single run on a plain Windows box.
 //   junction — a Windows reparse point, for DIRECTORIES, and it needs NO
-//              privilege. realpathSync follows it out of the prefix exactly as
-//              it follows a symlink, so the property under test is unchanged:
-//              the resolved target lands outside the allowlist and the check
-//              must say no.
+//              privilege. Measured on that box: realpathSync follows it out of
+//              /tmp/claude to the real target and isAllowedTranscriptPath says
+//              false — the same property, proven the same way.
+//
+// So on Windows this asks for a junction and NEVER attempts a symlink. Not as a
+// fallback, not inside a try: the attempt itself is what can raise an elevation
+// prompt at the person running the tests, and no test may ask anyone for
+// administrator rights. Elevation is not a thing the suite is allowed to want.
 //
 // A hardlink was the other candidate and does NOT work: it has no target to
 // resolve, realpath returns the link's own path inside the prefix, and nothing
 // escapes — it would assert the opposite of what we mean.
+//
+// If neither is available the test skips saying so, which beats both a
+// permanent red and a silent green.
 const LINK_KIND: "symlink" | "junction" | null = (() => {
   const probe = `/tmp/haiflow-linkprobe-${process.pid}`;
   const rm = (p: string) => { try { rmSync(p, { recursive: true, force: true }); } catch {} };
   try {
     mkdirSync(`${probe}/target`, { recursive: true });
     writeFileSync(`${probe}/target/file.txt`, "x");
+    if (process.platform === "win32") {
+      try {
+        symlinkSync(`${probe}/target`, `${probe}/as-junction`, "junction");
+        return "junction";
+      } catch {
+        return null; // deliberately no symlink attempt here — see above
+      }
+    }
     try {
       symlinkSync(`${probe}/target/file.txt`, `${probe}/as-symlink`);
       return "symlink";
-    } catch {}
-    try {
-      symlinkSync(`${probe}/target`, `${probe}/as-junction`, "junction");
-      return "junction";
-    } catch {}
-    return null;
+    } catch {
+      return null;
+    }
   } catch {
     return null;
   } finally {
     rm(probe);
   }
 })();
+
+const LINK_TEST_NAME = LINK_KIND
+  ? `follows links (${LINK_KIND}): rejects one planted under the prefix that resolves outside`
+  : process.platform === "win32"
+    ? "follows links: skipped — no junction possible here, and a Windows symlink needs administrator"
+    : "follows links: skipped — this user cannot create a symlink";
 
 // Plant an escaping link under /tmp/claude using whichever kind LINK_KIND found,
 // and hand back the link path, the outside target it must resolve to, and a
@@ -242,7 +258,7 @@ describe("security", () => {
     });
 
     test.skipIf(!LINK_KIND)(
-      `follows links (${LINK_KIND}): rejects one planted under the prefix that resolves outside`,
+      LINK_TEST_NAME,
       () => {
         const id = randomUUID();
         mkdirSync("/tmp/claude", { recursive: true });
