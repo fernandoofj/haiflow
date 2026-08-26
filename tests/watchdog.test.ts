@@ -119,9 +119,14 @@ describe("POST /interrupt", () => {
 //
 // A busy session whose tmux is gone can never fire the Stop hook: without
 // intervention it sits busy forever, its current task an orphan and its queue
-// starving behind it. The watchdog must transition it to offline and requeue
-// the orphan — and it does so even with HAIFLOW_WATCHDOG_RECOVER off, because
-// there is nothing to "recover" (no pane to interrupt): it is state hygiene.
+// starving behind it. The watchdog must transition it to offline and close the
+// orphan's ledger row — and it does so even with HAIFLOW_WATCHDOG_RECOVER off,
+// because there is nothing to "recover" (no pane to interrupt): it is state
+// hygiene.
+//
+// What it must NOT do by default is run the orphan again. See the two tests
+// below: the default drops it, and HAIFLOW_WATCHDOG_REQUEUE_ORPHAN=true opts
+// back into the old behaviour.
 describe("watchdog dead-tmux recovery", () => {
   const WD_PORT = 9891;
   const WD_DIR = "/tmp/haiflow-watchdog-dead-test";
@@ -170,7 +175,7 @@ describe("watchdog dead-tmux recovery", () => {
     if (existsSync(WD_DIR)) rmSync(WD_DIR, { recursive: true });
   });
 
-  test("recovers a busy session whose tmux died, requeueing the orphaned task", async () => {
+  test("recovers a busy session whose tmux died, WITHOUT rerunning the orphan", async () => {
     wdSeed("wd-dead", {
       status: "busy", since: new Date().toISOString(),
       currentTaskId: "orphan-1", currentPrompt: "finish me",
@@ -189,9 +194,10 @@ describe("watchdog dead-tmux recovery", () => {
     expect(status.status).toBe("offline"); // no longer stuck busy
     expect(status.currentTaskId).toBeUndefined();
 
-    // The orphaned task is requeued at the head, ahead of the waiting item.
+    // The orphan is NOT put back: it may already have written somewhere, and
+    // nothing here can tell. The item that was waiting behind it is untouched.
     const queue = await wdApi("/queue?session=wd-dead");
-    expect(queue.data.items.map((q: any) => q.id)).toEqual(["orphan-1", "q-behind"]);
+    expect(queue.data.items.map((q: any) => q.id)).toEqual(["q-behind"]);
 
     // The ledger row is closed as failed (not left "running" forever).
     const tasks = await wdApi("/tasks?session=wd-dead");

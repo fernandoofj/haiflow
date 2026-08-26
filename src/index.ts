@@ -112,6 +112,23 @@ const CALLBACK_ALLOW_HOSTS = (process.env.HAIFLOW_CALLBACK_ALLOW_HOSTS ?? "")
 const TASK_TIMEOUT_SEC = Number(process.env.HAIFLOW_TASK_TIMEOUT_SEC ?? 0) || 0;
 const WAITING_GRACE_MS = (Number(process.env.HAIFLOW_WAITING_GRACE_SEC ?? 120) || 120) * 1000;
 const WATCHDOG_RECOVER = (process.env.HAIFLOW_WATCHDOG_RECOVER ?? "false").toLowerCase() === "true";
+// Whether a dead-tmux orphan goes back on the queue. Off by default, and that
+// default is the safe one: the task may already have had side effects — a
+// commit, a PR, a write into a ServiceNow instance — before the pane died, and
+// nothing reachable from here tells "died before doing anything" apart from
+// "died after writing". Re-running bets on the first, and when the bet is wrong
+// the cost is a duplicated record in someone's production system.
+//
+// Not requeueing does not bring back the defect this path exists to kill: the
+// session still leaves "busy" for "offline" and the ledger row is still closed
+// as failed, so a caller waiting on that task sees it finish (failed) instead of
+// sitting behind a session that is stuck busy forever. What changes is only WHO
+// decides to run it again — a human who can look at the target first.
+//
+// Turn this on only for a workload whose tasks are safe to run twice.
+const WATCHDOG_REQUEUE_ORPHAN =
+  (process.env.HAIFLOW_WATCHDOG_REQUEUE_ORPHAN ?? "false").toLowerCase() === "true";
+
 // How often the watchdog scans for wedged sessions and reaps timed-out map runs.
 // Configurable mainly so tests can speed it up; 15s is plenty in production.
 const WATCHDOG_INTERVAL_MS = Number(process.env.HAIFLOW_WATCHDOG_INTERVAL_MS ?? 15_000) || 15_000;
@@ -3261,7 +3278,9 @@ const delayTickTimer = setInterval(() => {
 // opt-in via HAIFLOW_WATCHDOG_RECOVER; by default this only alerts in the logs.
 // One exception is always recovered: a busy session whose tmux is GONE can
 // never fire the Stop hook, so it is transitioned to offline and its orphaned
-// task requeued regardless of the opt-in — that's state hygiene, not recovery.
+// task closed as failed regardless of the opt-in — that's state hygiene, not
+// recovery. Whether that orphan also goes back on the queue is a separate,
+// off-by-default switch: see WATCHDOG_REQUEUE_ORPHAN.
 const watchdogTimer = setInterval(() => {
   for (const { session, status } of listSessions()) {
     if (status !== "busy") continue;
@@ -3271,15 +3290,18 @@ const watchdogTimer = setInterval(() => {
       log("warn", "watchdog_dead_tmux", { session, taskId: state.currentTaskId });
       if (state.currentTaskId) {
         // The task in flight is an orphan: no pane exists for it to finish in.
-        // Put it back at the head of the queue so it is the first thing picked
-        // up when the session comes back, and close the ledger row as failed.
-        const queue = readQueue(session);
-        queue.unshift({
-          id: state.currentTaskId, prompt: state.currentPrompt ?? "", addedAt: state.since,
-          chain: state.currentChain, dedupKey: state.currentDedupKey,
-          callbackUrl: state.currentCallbackUrl, ephemeral: state.currentEphemeral,
-        });
-        writeQueue(session, queue);
+        // Close the ledger row as failed so nobody waits on it forever. Putting
+        // it back on the queue is opt-in — see WATCHDOG_REQUEUE_ORPHAN for why
+        // running it again is a bet this code cannot win.
+        if (WATCHDOG_REQUEUE_ORPHAN) {
+          const queue = readQueue(session);
+          queue.unshift({
+            id: state.currentTaskId, prompt: state.currentPrompt ?? "", addedAt: state.since,
+            chain: state.currentChain, dedupKey: state.currentDedupKey,
+            callbackUrl: state.currentCallbackUrl, ephemeral: state.currentEphemeral,
+          });
+          writeQueue(session, queue);
+        }
         recordTaskFinish({ id: state.currentTaskId, session, status: "failed", error: "watchdog:tmux_died" });
       }
       writeState(session, {
@@ -3289,7 +3311,8 @@ const watchdogTimer = setInterval(() => {
         waiting: false, waitingMessage: undefined, waitingSince: undefined, deadlineAt: undefined,
       });
       log("info", "watchdog_recovered", {
-        session, reason: "tmux_died", taskId: state.currentTaskId, requeued: !!state.currentTaskId,
+        session, reason: "tmux_died", taskId: state.currentTaskId,
+        requeued: WATCHDOG_REQUEUE_ORPHAN && !!state.currentTaskId,
       });
       continue;
     }
