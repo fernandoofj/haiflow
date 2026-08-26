@@ -1,5 +1,5 @@
 import { test, expect, describe, beforeAll, afterAll } from "bun:test";
-import { mkdirSync, writeFileSync, existsSync, rmSync } from "fs";
+import { mkdirSync, writeFileSync, existsSync, rmSync, readFileSync } from "fs";
 import { join, resolve } from "path";
 import { installShim } from "./fixtures/shim";
 
@@ -328,20 +328,45 @@ describe("pool auto-start of an offline member (real tmux + fake claude)", () =>
   const AS_BASE = `http://localhost:${AS_PORT}`;
   let proc: ReturnType<typeof Bun.spawn>;
 
-  // Commands inside a tmux pane inherit the tmux SERVER's global environment,
-  // not the haiflow server's. If no tmux server runs yet, start one whose PATH
-  // sees the fake claude; if one already runs, require its PATH to see the
-  // shim — otherwise the pane would resolve the REAL claude binary, and no
-  // test may spawn that. Skip when the shim is unreachable.
+  // This suite needs exactly one property to hold: a pane opened by a client
+  // whose PATH sees AS_BIN_DIR must resolve `claude` to the shim there, never
+  // to the real binary — no test may spawn that. So ASK the pane, in a throwaway
+  // session, instead of reasoning about where its environment comes from.
+  //
+  // The reasoning is what used to be here, and it was both wrong and
+  // unconditionally false. Wrong: tmux 3.5a gives the pane the environment of
+  // the client that ran `new-session` (which is the haiflow server, whose PATH
+  // does carry the shim), not the server's global environment. Unconditionally
+  // false: it seeded that global environment with `tmux start-server`, and with
+  // the default `exit-empty on` a server holding no sessions exits at once —
+  // so the `show-environment` right after it always failed and this test never
+  // ran anywhere, on any machine, since tmux 2.4.
+  const AS_PROBE_SESSION = `haiflow-autostart-probe-${process.pid}`;
   const CAN_AUTOSTART = (() => {
     if (!HAS_TMUX) return false;
-    Bun.spawnSync(["tmux", "start-server"], {
-      env: { ...process.env, PATH: `${AS_BIN_DIR}${PATH_SEP}${process.env.PATH}` },
-    });
-    const r = Bun.spawnSync(["tmux", "show-environment", "-g", "PATH"]);
-    if (r.exitCode !== 0) return false;
-    const line = r.stdout.toString().split("\n").find((l) => l.startsWith("PATH=")) ?? "";
-    return line.includes(AS_BIN_DIR);
+    const probeFile = `${AS_BIN_DIR}/where-is-claude.txt`;
+    const env = { ...process.env, PATH: `${AS_BIN_DIR}${PATH_SEP}${process.env.PATH}` };
+    try {
+      installShim(AS_BIN_DIR, "claude", FAKE_CLAUDE);
+      if (existsSync(probeFile)) rmSync(probeFile, { force: true });
+      Bun.spawnSync(["tmux", "kill-session", "-t", AS_PROBE_SESSION], { env });
+      const started = Bun.spawnSync(
+        ["tmux", "new-session", "-d", "-s", AS_PROBE_SESSION, "-c", "/tmp",
+         "sh", "-c", `command -v claude > ${probeFile} 2>&1; sleep 10`],
+        { env },
+      );
+      if (started.exitCode !== 0) return false;
+      let resolved = "";
+      for (let i = 0; i < 60; i++) {
+        if (existsSync(probeFile)) { resolved = readFileSync(probeFile, "utf8").trim(); break; }
+        Bun.sleepSync(50);
+      }
+      return resolved.startsWith(AS_BIN_DIR);
+    } catch {
+      return false;
+    } finally {
+      Bun.spawnSync(["tmux", "kill-session", "-t", AS_PROBE_SESSION], { env });
+    }
   })();
 
   async function asApi(path: string, method = "GET", body?: object) {
@@ -380,6 +405,13 @@ describe("pool auto-start of an offline member (real tmux + fake claude)", () =>
         PORT: String(AS_PORT), HAIFLOW_PORT: String(AS_PORT),
         HAIFLOW_DATA_DIR: AS_DIR, HAIFLOW_API_KEY: TEST_API_KEY,
         HAIFLOW_GUARDRAILS: "false",
+        // The pane inherits this environment (it is the client that opens the
+        // session), so this reaches the fake claude. Its default 120ms turnaround
+        // is shorter than the /status round trip that follows the dispatch: the
+        // member could be back to idle before the test ever saw it busy. Widen
+        // the processing window so "dispatch marked it busy" stays a real
+        // assertion instead of a race the fast machine loses.
+        FAKE_CLAUDE_DELAY_MS: "2000",
       },
       stdout: "ignore", stderr: "ignore",
     });
