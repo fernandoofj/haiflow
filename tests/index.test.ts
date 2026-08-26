@@ -2,6 +2,7 @@ import { test, expect, describe } from "bun:test";
 import { mkdirSync, writeFileSync, symlinkSync, unlinkSync, rmSync } from "fs";
 import { randomUUID } from "crypto";
 import {
+  MAX_SESSION_NAME,
   sanitizeSession,
   sanitizeId,
   tmuxName,
@@ -38,9 +39,39 @@ describe("input sanitization", () => {
       expect(sanitizeSession("")).toBe("default");
     });
 
-    test("truncates to 64 chars", () => {
-      const long = "a".repeat(100);
-      expect(sanitizeSession(long).length).toBe(64);
+    test("truncates at MAX_SESSION_NAME, which CF-315 raised from 64 to 96", () => {
+      const long = "a".repeat(200);
+      expect(MAX_SESSION_NAME).toBe(96);
+      expect(sanitizeSession(long).length).toBe(MAX_SESSION_NAME);
+      // A name at the ceiling passes through whole; one char more is cut.
+      expect(sanitizeSession("b".repeat(96))).toBe("b".repeat(96));
+      expect(sanitizeSession("b".repeat(97)).length).toBe(96);
+    });
+
+    test("keeps the SNAF stage names that 64 used to cut", () => {
+      // The names that forced CF-315: SNAF calls a session `<run_id>-<stage>`,
+      // and a uuid is already 36 of the old 64. `architecture_contract_agent`
+      // landed on exactly 64 -- on the post -- and `requirements_compiler-
+      // revision` went past it and reached the session list as `...-revis`.
+      const runId = "123e4567-e89b-12d3-a456-426614174000"; // 36 chars
+      const onThePost = `${runId}-architecture_contract_agent`;
+      const overflowed = `${runId}-requirements_compiler-revision`;
+      expect(onThePost.length).toBe(64);
+      expect(overflowed.length).toBe(67);
+      expect(sanitizeSession(onThePost)).toBe(onThePost);
+      expect(sanitizeSession(overflowed)).toBe(overflowed); // no longer `...-revis`
+    });
+
+    test("two stages that differ only past 64 stay two sessions", () => {
+      // Truncation was never cosmetic: two names alike up to the cut became the
+      // SAME session, so two tasks shared one Claude and one context leaked into
+      // the other. These differ first at char 65 -- under the old ceiling they
+      // collided, under the current one they do not.
+      const runId = "123e4567-e89b-12d3-a456-426614174000";
+      const a = `${runId}-requirements_compiler-revision`;
+      const b = `${runId}-requirements_compiler-revisited`;
+      expect(a.slice(0, 64)).toBe(b.slice(0, 64)); // indistinguishable at 64
+      expect(sanitizeSession(a)).not.toBe(sanitizeSession(b));
     });
   });
 
