@@ -1,2 +1,9 @@
 [serve.static]
 plugins = ["bun-plugin-tailwind"]
+
+# Provisiona um Redis para a suite antes de qualquer arquivo de teste carregar:
+# usa REDIS_URL do ambiente se houver (CI), senao um Redis local, senao sobe um
+# container redis:7 descartavel e o derruba no fim. Escopo [test]: `bun run` dos
+# servidores filhos nao passa por aqui.
+[test]
+preload = ["./tests/setup/redis-testcontainer.ts"]

@@ -35,6 +35,27 @@ test("hello world", () => {
 });
 ```
 
+### Redis na suite
+
+Parte da suite (EventBus, pipeline, gateway de ingest) so tem o que asserir com
+um Redis vivo. O preload `tests/setup/redis-testcontainer.ts` (registrado em
+`bunfig.toml`, secao `[test]`) resolve isso sozinho, nesta ordem:
+
+1. `REDIS_URL` no ambiente (o caso do CI) — usa esse e **nao** sobe container.
+2. Redis respondendo em `127.0.0.1:6379` — usa o que ja esta de pe.
+3. Docker disponivel — sobe um `redis:7` descartavel em porta efemera de
+   loopback, exporta `REDIS_URL` e o derruba no fim, inclusive se a suite falhar.
+4. Nada disso — os testes que exigem Redis **pulam com motivo impresso**
+   (`describeRedis`/`testRedis` em `tests/setup/redis.ts`), nunca falham.
+
+Um runner morto a forca deixa o container de pe; a proxima rodada o varre pelo
+PID embutido no nome. Para exercitar o caminho 4 de proposito:
+`HAIFLOW_TEST_NO_DOCKER=1 bun test`.
+
+O grupo `ingest replay protection without Redis` continua apontado para
+`redis://127.0.0.1:1` de proposito — ele testa Redis fora do ar e nao deve ver
+o container.
+
 ## Frontend
 
 Use HTML imports with `Bun.serve()`. Don't use `vite`. HTML imports fully support React, CSS, Tailwind.
