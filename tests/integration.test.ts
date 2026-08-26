@@ -10,7 +10,7 @@ import { existsSync, rmSync } from "fs";
  * - Redis running (docker run -d -p 6379:6379 redis)
  * - No other haiflow server on the test port
  *
- * Run: bun test tests/integration.test.ts
+ * Run: HAIFLOW_RUN_INTEGRATION_TESTS=1 bun test tests/integration.test.ts
  */
 
 const TEST_PORT = 9877;
@@ -18,9 +18,21 @@ const TEST_DIR = "/tmp/haiflow-integration-test";
 const TEST_API_KEY = "integration-test-key";
 const BASE = `http://localhost:${TEST_PORT}`;
 const TIMEOUT = 120_000; // 2 min per test — Claude needs time
-// These start a REAL Claude session, so skip when the CLI isn't installed
-// (e.g. CI). Locally, with Claude on PATH, they run.
-const HAS_CLAUDE = !!Bun.which("claude");
+// These start a REAL Claude session: real quota, real machine, real writes.
+//
+// The gate used to be `Bun.which("claude")` alone, and that is not a decision —
+// it is "Claude Code happens to be installed", which is true of every developer
+// machine this repo is worked on. `bun test` with no arguments, or one careless
+// `bun test tests/integration.test.ts`, was enough to launch the real CLI. The
+// same shape burned tests/consumer-lifecycle.test.ts, where a tmux clone on
+// PATH opened a gate that assumed instead of measuring.
+//
+// So running the real thing now takes an explicit ask, the same opt-in
+// tests/guardrail-behaviour.test.ts already uses for the same reason. Presence
+// of the CLI stays as the capability check on top of it: opting in on a machine
+// without Claude should skip, not fail.
+const OPTED_IN = process.env.HAIFLOW_RUN_INTEGRATION_TESTS === "1";
+const HAS_CLAUDE = OPTED_IN && !!Bun.which("claude");
 
 let server: ReturnType<typeof Bun.spawn>;
 
@@ -54,6 +66,7 @@ function parseSSE(text: string): { messages?: string[]; error?: string } {
 }
 
 beforeAll(async () => {
+  if (!HAS_CLAUDE) return; // every test below skips; start nothing
   // Kill any stale tmux sessions left behind by an aborted prior run.
   // Without this, startClaudeSession sees a "running" session, skips
   // launching Claude, and the new test sends prompts into a dead pane.
@@ -89,6 +102,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  if (!HAS_CLAUDE) return;
   // Stop any test sessions
   try {
     await api("/session/stop", "POST", { session: "integration-test" });

@@ -25,7 +25,29 @@ const BASE = `http://localhost:${TEST_PORT}`;
 // The watchdog also recovers busy sessions whose tmux died. These unit tests
 // seed busy sessions without tmux on purpose, so keep the tick far away while
 // they run — the dedicated suite below tests that recovery on its own server.
-const HAS_TMUX = !!Bun.which("tmux");
+//
+// The LIVE-session test at the bottom needs one property, and `Bun.which("tmux")`
+// asserted a different one: that SOMETHING named tmux exists. What it actually
+// needs is that a session it starts is reported alive by `tmux has-session` —
+// the same call the server's isTmuxRunning makes. Anything else and the test
+// reads "the tmux died" and measures the wrong branch of the watchdog.
+//
+// Nothing here spawns claude, so the cost of being wrong is a puzzling red
+// rather than a real Claude session (see tests/consumer-lifecycle.test.ts for
+// where that same shape did cost that). Still cheap to just ask.
+const TMUX_PROBE_SESSION = `haiflow-watchdog-probe-${process.pid}`;
+const TMUX_IS_LIVE = (() => {
+  if (!Bun.which("tmux")) return false;
+  try {
+    Bun.spawnSync(["tmux", "kill-session", "-t", TMUX_PROBE_SESSION]);
+    if (Bun.spawnSync(["tmux", "new-session", "-d", "-s", TMUX_PROBE_SESSION]).exitCode !== 0) return false;
+    return Bun.spawnSync(["tmux", "has-session", "-t", TMUX_PROBE_SESSION]).exitCode === 0;
+  } catch {
+    return false;
+  } finally {
+    Bun.spawnSync(["tmux", "kill-session", "-t", TMUX_PROBE_SESSION]);
+  }
+})();
 
 let server: ReturnType<typeof Bun.spawn>;
 const authHeaders: Record<string, string> = { Authorization: `Bearer ${TEST_API_KEY}` };
@@ -54,7 +76,7 @@ beforeAll(async () => {
       PORT: String(TEST_PORT), HAIFLOW_DATA_DIR: TEST_DIR, HAIFLOW_API_KEY: TEST_API_KEY,
       HAIFLOW_GUARDRAILS: "false",
       // Keep the tick far away while these unit tests run: they seed busy
-      // sessions without tmux on purpose (see the note near HAS_TMUX).
+      // sessions without tmux on purpose (see the note near TMUX_IS_LIVE).
       HAIFLOW_WATCHDOG_INTERVAL_MS: "60000",
     },
     stdout: "ignore", stderr: "ignore",
@@ -221,7 +243,7 @@ describe("watchdog dead-tmux recovery", () => {
     expect(row.error).toBe("watchdog:tmux_died");
   }, 20000);
 
-  test.skipIf(!HAS_TMUX)("leaves a LIVE wedged session alone when WATCHDOG_RECOVER is off", async () => {
+  test.skipIf(!TMUX_IS_LIVE)("leaves a LIVE wedged session alone when WATCHDOG_RECOVER is off", async () => {
     // The opt-in still gates the general recovery path: only the dead-tmux
     // case is recovered without HAIFLOW_WATCHDOG_RECOVER=true.
     Bun.spawnSync(["tmux", "new-session", "-d", "-s", "wd-live"]);
