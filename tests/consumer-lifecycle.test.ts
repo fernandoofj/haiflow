@@ -1,6 +1,7 @@
 import { test, expect, describe, beforeAll, afterAll } from "bun:test";
-import { existsSync, rmSync, mkdirSync, chmodSync } from "fs";
+import { existsSync, rmSync, readFileSync, mkdirSync } from "fs";
 import { join } from "path";
+import { installShim } from "./fixtures/shim";
 
 /**
  * Consumer lifecycle e2e — simulates an external service driving haiflow end to
@@ -13,7 +14,9 @@ import { join } from "path";
  * exposed on PATH as `claude`. haiflow spawns it in tmux exactly as it would the
  * real CLI, so every HTTP contract, hook handshake, and tmux send path is
  * exercised for real — only the model is faked. That makes the consumer
- * lifecycle deterministic and runnable anywhere tmux exists.
+ * lifecycle deterministic and runnable anywhere a pane can be shown to resolve
+ * `claude` to the fake — see CAN_FAKE_CLAUDE below, which measures exactly that
+ * and skips everything otherwise.
  */
 
 const TEST_PORT = 9899; // outside the 9876-9890 cluster other test files use
@@ -37,7 +40,54 @@ const ALL_SESSIONS = [
 const TIMEOUT = 30_000;
 
 const FAKE_SRC = join(import.meta.dir, "fixtures", "fake-claude.ts");
-const HAS_TMUX = !!Bun.which("tmux");
+const PATH_SEP = process.platform === "win32" ? ";" : ":";
+
+// What this suite needs is not "some tmux exists" but one property: a pane
+// opened by a client whose PATH sees BIN_DIR must resolve `claude` to the shim
+// there — never to the real CLI. haiflow starts sessions with
+// `tmux new-session -d -s <name> -c <cwd> claude ...`, so if that resolution
+// lands anywhere else, these twenty tests boot the REAL Claude Code: real
+// quota, real machine, real writes.
+//
+// `Bun.which("tmux")` never checked that property, it assumed it — and the
+// assumption is false wherever the `tmux` on PATH is not the tmux this was
+// written against. On the Windows box where this was found it is psmux
+// (winget marlocarlo.psmux, which answers `tmux -V` with "tmux 3.3.6"), whose
+// panes do not resolve a POSIX `sh` shim at all. The gate said "go".
+//
+// So ASK the pane the question the suite depends on, in a throwaway session,
+// instead of reasoning about where its environment comes from. `command -v`
+// resolves without executing, so the probe itself can never launch anything —
+// the gate cannot be the thing that starts the real Claude. Only an answer
+// inside BIN_DIR opens it; a pane running another shell, a tmux that ignores
+// the client environment, or a shim that did not install all read as "skip".
+const PROBE_SESSION = `haiflow-consumer-probe-${process.pid}`;
+const CAN_FAKE_CLAUDE = (() => {
+  if (!Bun.which("tmux")) return false;
+  const probeFile = join(BIN_DIR, "where-is-claude.txt");
+  const env = { ...process.env, PATH: `${BIN_DIR}${PATH_SEP}${process.env.PATH}` };
+  try {
+    installShim(BIN_DIR, "claude", FAKE_SRC);
+    if (existsSync(probeFile)) rmSync(probeFile, { force: true });
+    Bun.spawnSync(["tmux", "kill-session", "-t", PROBE_SESSION], { env });
+    const started = Bun.spawnSync(
+      ["tmux", "new-session", "-d", "-s", PROBE_SESSION, "-c", "/tmp",
+       "sh", "-c", `command -v claude > ${probeFile} 2>&1; sleep 10`],
+      { env },
+    );
+    if (started.exitCode !== 0) return false;
+    let resolved = "";
+    for (let i = 0; i < 60; i++) {
+      if (existsSync(probeFile)) { resolved = readFileSync(probeFile, "utf8").trim(); break; }
+      Bun.sleepSync(50);
+    }
+    return resolved.startsWith(BIN_DIR);
+  } catch {
+    return false;
+  } finally {
+    Bun.spawnSync(["tmux", "kill-session", "-t", PROBE_SESSION], { env });
+  }
+})();
 
 let server: ReturnType<typeof Bun.spawn>;
 
@@ -140,18 +190,17 @@ function waitForCallback(match: (cb: any) => boolean): Promise<any> {
 }
 
 beforeAll(async () => {
+  if (!CAN_FAKE_CLAUDE) return; // every test below skips; nothing to set up
   for (const s of ALL_SESSIONS) Bun.spawnSync(["tmux", "kill-session", "-t", s]);
   for (const dir of [TEST_DIR, BIN_DIR]) {
     if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
   }
 
-  // Expose the fake as `claude` on a bin dir we prepend to PATH. A tiny sh
-  // shim execs it with the absolute bun path so resolution never depends on the
-  // tmux session's own PATH for `bun` itself.
-  mkdirSync(BIN_DIR, { recursive: true });
-  const shim = join(BIN_DIR, "claude");
-  await Bun.write(shim, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(FAKE_SRC)} "$@"\n`);
-  chmodSync(shim, 0o755);
+  // Expose the fake as `claude` on a bin dir we prepend to PATH, so the pane
+  // resolves `claude` to the fixture. installShim runs it with the absolute bun
+  // path (resolution never depends on the pane's own PATH for `bun` itself) and
+  // handles the Windows case, where an `sh` shim is not executable at all.
+  installShim(BIN_DIR, "claude", FAKE_SRC);
 
   // Local receiver for completion callbacks.
   callbackServer = Bun.serve({
@@ -172,7 +221,7 @@ beforeAll(async () => {
   server = Bun.spawn(["bun", "run", "src/index.ts"], {
     env: {
       ...process.env,
-      PATH: `${BIN_DIR}:${process.env.PATH}`,
+      PATH: `${BIN_DIR}${PATH_SEP}${process.env.PATH}`,
       PORT: String(TEST_PORT),
       HAIFLOW_DATA_DIR: TEST_DIR,
       HAIFLOW_API_KEY: TEST_API_KEY,
@@ -204,6 +253,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  if (!CAN_FAKE_CLAUDE) return;
   try {
     await api("/session/stop", "POST", { session: SESSION });
   } catch {}
@@ -217,7 +267,7 @@ afterAll(async () => {
 });
 
 describe("consumer lifecycle", () => {
-  test.skipIf(!HAS_TMUX)(
+  test.skipIf(!CAN_FAKE_CLAUDE)(
     "start session → send payload → haiflow processes → returns → stop",
     async () => {
       // 1. A consumer starts a session.
@@ -271,7 +321,7 @@ describe("consumer lifecycle", () => {
     TIMEOUT
   );
 
-  test.skipIf(!HAS_TMUX)(
+  test.skipIf(!CAN_FAKE_CLAUDE)(
     "delivers a multiline payload as a single prompt, intact",
     async () => {
       await api("/session/start", "POST", { session: SESSION, cwd: "/tmp" });
@@ -306,7 +356,7 @@ describe("consumer lifecycle", () => {
     TIMEOUT
   );
 
-  test.skipIf(!HAS_TMUX)(
+  test.skipIf(!CAN_FAKE_CLAUDE)(
     "delivers a large multiline payload via the temp-file path",
     async () => {
       await api("/session/start", "POST", { session: SESSION, cwd: "/tmp" });
@@ -336,7 +386,7 @@ describe("consumer lifecycle", () => {
     TIMEOUT
   );
 
-  test.skipIf(!HAS_TMUX)(
+  test.skipIf(!CAN_FAKE_CLAUDE)(
     "captures the response from the transcript (primary path) with usage + model",
     async () => {
       await api("/session/start", "POST", { session: SESSION, cwd: "/tmp" });
@@ -369,7 +419,7 @@ describe("consumer lifecycle", () => {
     TIMEOUT
   );
 
-  test.skipIf(!HAS_TMUX)(
+  test.skipIf(!CAN_FAKE_CLAUDE)(
     "streams a status event before the response completes",
     async () => {
       await api("/session/start", "POST", { session: SESSION, cwd: "/tmp" });
@@ -391,7 +441,7 @@ describe("consumer lifecycle", () => {
     TIMEOUT
   );
 
-  test.skipIf(!HAS_TMUX)(
+  test.skipIf(!CAN_FAKE_CLAUDE)(
     "streams MessageDisplay deltas before the response completes",
     async () => {
       await api("/session/start", "POST", { session: SESSION, cwd: "/tmp" });
@@ -420,7 +470,7 @@ describe("consumer lifecycle", () => {
     TIMEOUT
   );
 
-  test.skipIf(!HAS_TMUX)(
+  test.skipIf(!CAN_FAKE_CLAUDE)(
     "polling a response while it's still running returns 202 pending",
     async () => {
       await api("/session/start", "POST", { session: SESSION, cwd: "/tmp" });
@@ -442,7 +492,7 @@ describe("consumer lifecycle", () => {
     TIMEOUT
   );
 
-  test.skipIf(!HAS_TMUX)(
+  test.skipIf(!CAN_FAKE_CLAUDE)(
     "queues a second payload while busy and drains it in order",
     async () => {
       await api("/session/start", "POST", { session: SESSION, cwd: "/tmp" });
@@ -475,7 +525,7 @@ describe("consumer lifecycle", () => {
     TIMEOUT * 2
   );
 
-  test.skipIf(!HAS_TMUX)(
+  test.skipIf(!CAN_FAKE_CLAUDE)(
     "starting an already-running session is idempotent",
     async () => {
       const first = await api("/session/start", "POST", { session: SESSION, cwd: "/tmp" });
@@ -500,7 +550,7 @@ describe("consumer lifecycle", () => {
 });
 
 describe("consumer error paths", () => {
-  test.skipIf(!HAS_TMUX)(
+  test.skipIf(!CAN_FAKE_CLAUDE)(
     "sending a payload to a stopped session returns 503 offline",
     async () => {
       await api("/session/start", "POST", { session: SESSION, cwd: "/tmp" });
@@ -515,7 +565,7 @@ describe("consumer error paths", () => {
     TIMEOUT
   );
 
-  test.skipIf(!HAS_TMUX)(
+  test.skipIf(!CAN_FAKE_CLAUDE)(
     "stopping a session that was never started returns 404",
     async () => {
       const stop = await api("/session/stop", "POST", { session: "consumer-never-started" });
@@ -524,7 +574,7 @@ describe("consumer error paths", () => {
     TIMEOUT
   );
 
-  test.skipIf(!HAS_TMUX)(
+  test.skipIf(!CAN_FAKE_CLAUDE)(
     "polling an unknown response id returns 404",
     async () => {
       const res = await api(`/responses/no-such-task-id?session=${SESSION}`);
@@ -533,7 +583,7 @@ describe("consumer error paths", () => {
     TIMEOUT
   );
 
-  test.skipIf(!HAS_TMUX)(
+  test.skipIf(!CAN_FAKE_CLAUDE)(
     "a session whose hooks never link fails start instead of silently dropping payloads",
     async () => {
       const nolinkDir = "/tmp/haiflow-consumer-nolink";
@@ -558,7 +608,7 @@ describe("consumer error paths", () => {
     TIMEOUT
   );
 
-  test.skipIf(!HAS_TMUX)(
+  test.skipIf(!CAN_FAKE_CLAUDE)(
     "a session waiting for workspace trust fails with a clear action",
     async () => {
       const trustDir = "/tmp/haiflow-consumer-trust";
@@ -580,7 +630,7 @@ describe("consumer error paths", () => {
     TIMEOUT
   );
 
-  test.skipIf(!HAS_TMUX)(
+  test.skipIf(!CAN_FAKE_CLAUDE)(
     "dismisses safe Claude Code onboarding prompts during startup",
     async () => {
       const onboardingDir = "/tmp/haiflow-consumer-onboarding";
@@ -607,7 +657,7 @@ describe("consumer error paths", () => {
 });
 
 describe("fire-and-forget", () => {
-  test.skipIf(!HAS_TMUX)(
+  test.skipIf(!CAN_FAKE_CLAUDE)(
     "ephemeral: one trigger auto-starts an offline session and stops it after responding",
     async () => {
       const fofSession = "consumer-fof";
@@ -639,7 +689,7 @@ describe("fire-and-forget", () => {
     TIMEOUT
   );
 
-  test.skipIf(!HAS_TMUX)(
+  test.skipIf(!CAN_FAKE_CLAUDE)(
     "callbackUrl: haiflow POSTs the result to the caller's webhook on completion",
     async () => {
       await api("/session/start", "POST", { session: SESSION, cwd: "/tmp" });
@@ -668,7 +718,7 @@ describe("fire-and-forget", () => {
     TIMEOUT
   );
 
-  test.skipIf(!HAS_TMUX)(
+  test.skipIf(!CAN_FAKE_CLAUDE)(
     "both: ephemeral lifecycle and a completion callback together",
     async () => {
       const bothSession = "consumer-both";
@@ -696,7 +746,7 @@ describe("fire-and-forget", () => {
     TIMEOUT
   );
 
-  test.skipIf(!HAS_TMUX)(
+  test.skipIf(!CAN_FAKE_CLAUDE)(
     "rejects a callbackUrl whose host is not allowlisted",
     async () => {
       await api("/session/start", "POST", { session: SESSION, cwd: "/tmp" });
@@ -715,7 +765,7 @@ describe("fire-and-forget", () => {
     TIMEOUT
   );
 
-  test.skipIf(!HAS_TMUX)(
+  test.skipIf(!CAN_FAKE_CLAUDE)(
     "ephemeral trigger to an offline session without a cwd is rejected",
     async () => {
       const s = "consumer-nocwd-fof";
