@@ -1,5 +1,21 @@
 import { test, expect, describe, beforeAll, afterAll } from "bun:test";
 import { mkdirSync, writeFileSync, existsSync, rmSync } from "fs";
+import { resolve } from "path";
+
+// Absolute entry, spawned with the running bun binary rather than via
+// `bun run`: `bun run` interposes a launcher process, and killing the launcher
+// leaves the real server alive holding its data dir open — EBUSY on the
+// afterAll cleanups here, and a stray listening port everywhere else.
+const SERVER_ENTRY = resolve(import.meta.dir, "../src/index.ts");
+
+// Kill a spawned server and wait until it is really gone, then remove the dir
+// it was holding. The retries cover the short window where the handle outlives
+// the process.
+async function stopServer(proc: ReturnType<typeof Bun.spawn> | undefined, dir: string) {
+  proc?.kill();
+  await proc?.exited;
+  if (existsSync(dir)) rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+}
 
 const TEST_PORT = 9880;
 const TEST_DIR = "/tmp/haiflow-watchdog-test";
@@ -32,7 +48,7 @@ function seed(session: string, claudeId: string, state: object) {
 
 beforeAll(async () => {
   if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
-  server = Bun.spawn(["bun", "run", "src/index.ts"], {
+  server = Bun.spawn([process.execPath, SERVER_ENTRY], {
     env: {
       ...process.env,
       PORT: String(TEST_PORT), HAIFLOW_DATA_DIR: TEST_DIR, HAIFLOW_API_KEY: TEST_API_KEY,
@@ -50,9 +66,8 @@ beforeAll(async () => {
   throw new Error("Server failed to start");
 });
 
-afterAll(() => {
-  server?.kill();
-  if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+afterAll(async () => {
+  await stopServer(server, TEST_DIR);
 });
 
 describe("POST /hooks/notification", () => {
@@ -151,7 +166,7 @@ describe("watchdog dead-tmux recovery", () => {
 
   beforeAll(async () => {
     if (existsSync(WD_DIR)) rmSync(WD_DIR, { recursive: true });
-    proc = Bun.spawn(["bun", "run", "src/index.ts"], {
+    proc = Bun.spawn([process.execPath, SERVER_ENTRY], {
       env: {
         ...process.env,
         PORT: String(WD_PORT), HAIFLOW_DATA_DIR: WD_DIR, HAIFLOW_API_KEY: TEST_API_KEY,
@@ -170,9 +185,8 @@ describe("watchdog dead-tmux recovery", () => {
     throw new Error("Server failed to start");
   });
 
-  afterAll(() => {
-    proc?.kill();
-    if (existsSync(WD_DIR)) rmSync(WD_DIR, { recursive: true });
+  afterAll(async () => {
+    await stopServer(proc, WD_DIR);
   });
 
   test("recovers a busy session whose tmux died, WITHOUT rerunning the orphan", async () => {

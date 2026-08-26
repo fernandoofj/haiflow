@@ -1,6 +1,13 @@
 import { test, expect, describe, beforeAll, afterAll } from "bun:test";
-import { mkdirSync, writeFileSync, existsSync, rmSync, chmodSync } from "fs";
-import { join } from "path";
+import { mkdirSync, writeFileSync, existsSync, rmSync } from "fs";
+import { join, resolve } from "path";
+import { installShim } from "./fixtures/shim";
+
+// Absolute entry, spawned with the running bun binary rather than via
+// `bun run`: `bun run` interposes a launcher process, and killing the launcher
+// leaves the real server alive holding its data dir open — EBUSY on the
+// afterAll cleanup here, and a stray listening port everywhere else.
+const SERVER_ENTRY = resolve(import.meta.dir, "../src/index.ts");
 
 const TEST_PORT = 9882;
 const TEST_DIR = "/tmp/haiflow-queue-test";
@@ -41,14 +48,8 @@ function seedBusy(session: string, taskId = "current"): string {
 beforeAll(async () => {
   if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
   if (existsSync(BIN_DIR)) rmSync(BIN_DIR, { recursive: true, force: true });
-  mkdirSync(BIN_DIR, { recursive: true });
-  // POSIX shim + Windows shim, both exec'ing the fake with the absolute bun path.
-  writeFileSync(join(BIN_DIR, "tmux"), `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(FAKE_TMUX)} "$@"\n`);
-  chmodSync(join(BIN_DIR, "tmux"), 0o755);
-  if (process.platform === "win32") {
-    writeFileSync(join(BIN_DIR, "tmux.cmd"), `@echo off\r\n${JSON.stringify(process.execPath)} ${JSON.stringify(FAKE_TMUX)} %*\r\n`);
-  }
-  server = Bun.spawn(["bun", "run", "src/index.ts"], {
+  installShim(BIN_DIR, "tmux", FAKE_TMUX);
+  server = Bun.spawn([process.execPath, SERVER_ENTRY], {
     env: {
       ...process.env,
       PATH: `${BIN_DIR}${PATH_SEP}${process.env.PATH}`,
@@ -63,10 +64,15 @@ beforeAll(async () => {
   throw new Error("Server failed to start");
 });
 
-afterAll(() => {
+afterAll(async () => {
   server?.kill();
-  if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
-  if (existsSync(BIN_DIR)) rmSync(BIN_DIR, { recursive: true, force: true });
+  // Wait for the process to really be gone before deleting the dirs it holds
+  // open: on Windows an rm against a live server's data dir answers EBUSY. The
+  // retries cover the short window where the handle outlives the process.
+  await server?.exited;
+  for (const dir of [TEST_DIR, BIN_DIR]) {
+    if (existsSync(dir)) rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+  }
 });
 
 describe("smart queue", () => {

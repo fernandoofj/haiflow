@@ -1,6 +1,24 @@
 import { test, expect, describe, beforeAll, afterAll } from "bun:test";
-import { mkdirSync, writeFileSync, existsSync, rmSync, chmodSync } from "fs";
-import { join } from "path";
+import { mkdirSync, writeFileSync, existsSync, rmSync } from "fs";
+import { join, resolve } from "path";
+import { installShim } from "./fixtures/shim";
+
+// Absolute entry, spawned with the running bun binary rather than via
+// `bun run`: `bun run` interposes a launcher process, and killing the launcher
+// leaves the real server alive holding its data dir open — EBUSY on every
+// afterAll here, and a stray listening port everywhere else.
+const SERVER_ENTRY = resolve(import.meta.dir, "../src/index.ts");
+
+// Kill a spawned server and wait until it is really gone, then remove the dirs
+// it was holding. Without the wait, Windows answers rm with EBUSY; the retries
+// cover the short window where the handle outlives the process.
+async function stopServer(proc: ReturnType<typeof Bun.spawn> | undefined, ...dirs: string[]) {
+  proc?.kill();
+  await proc?.exited;
+  for (const dir of dirs) {
+    if (existsSync(dir)) rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+  }
+}
 
 const TEST_PORT = 9883;
 const TEST_DIR = "/tmp/haiflow-pool-test";
@@ -36,19 +54,6 @@ function seedIdle(session: string) {
   writeFileSync(`${dir}/state.json`, JSON.stringify({ status: "idle", since: new Date().toISOString() }));
 }
 
-// Expose an executable double on PATH for both POSIX (`tmux`/`claude` sh shim)
-// and Windows (`tmux.cmd`/`claude.cmd`), exec'ed with the absolute bun path so
-// resolution never depends on the spawned process' own PATH for `bun`.
-function installShim(binDir: string, name: string, target: string) {
-  mkdirSync(binDir, { recursive: true });
-  const sh = join(binDir, name);
-  writeFileSync(sh, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(target)} "$@"\n`);
-  chmodSync(sh, 0o755);
-  if (process.platform === "win32") {
-    writeFileSync(join(binDir, `${name}.cmd`), `@echo off\r\n${JSON.stringify(process.execPath)} ${JSON.stringify(target)} %*\r\n`);
-  }
-}
-
 beforeAll(async () => {
   if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
   if (existsSync(BIN_DIR)) rmSync(BIN_DIR, { recursive: true, force: true });
@@ -79,7 +84,7 @@ beforeAll(async () => {
   mkdirSync(`${ow1}/responses`, { recursive: true });
   writeFileSync(`${ow1}/state.json`, JSON.stringify({ status: "offline", since: new Date().toISOString(), cwd: "/tmp" }));
 
-  server = Bun.spawn(["bun", "run", "src/index.ts"], {
+  server = Bun.spawn([process.execPath, SERVER_ENTRY], {
     env: {
       ...process.env,
       PATH: `${BIN_DIR}${PATH_SEP}${process.env.PATH}`,
@@ -97,10 +102,8 @@ beforeAll(async () => {
   throw new Error("Server failed to start");
 });
 
-afterAll(() => {
-  server?.kill();
-  if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
-  if (existsSync(BIN_DIR)) rmSync(BIN_DIR, { recursive: true, force: true });
+afterAll(async () => {
+  await stopServer(server, TEST_DIR, BIN_DIR);
 });
 
 describe("worker pool", () => {
@@ -266,7 +269,7 @@ describe("map partial timeout", () => {
     // watchdog tick costs a few process starts. Keep the reap window (3s)
     // comfortably above that overhead: the point of this test is the partial
     // reduce itself, not shaving it to the fastest possible tick.
-    proc = Bun.spawn(["bun", "run", "src/index.ts"], {
+    proc = Bun.spawn([process.execPath, SERVER_ENTRY], {
       env: {
         ...process.env,
         PATH: `${BIN_DIR}${PATH_SEP}${process.env.PATH}`,
@@ -283,9 +286,8 @@ describe("map partial timeout", () => {
     throw new Error("Server failed to start");
   });
 
-  afterAll(() => {
-    proc?.kill();
-    if (existsSync(PT_DIR)) rmSync(PT_DIR, { recursive: true });
+  afterAll(async () => {
+    await stopServer(proc, PT_DIR);
   });
 
   test("reducer fires with '(no output)' when a shard never returns", async () => {
@@ -371,7 +373,7 @@ describe("pool auto-start of an offline member (real tmux + fake claude)", () =>
       status: "offline", since: new Date().toISOString(), cwd: "/tmp", model: null,
     }));
 
-    proc = Bun.spawn(["bun", "run", "src/index.ts"], {
+    proc = Bun.spawn([process.execPath, SERVER_ENTRY], {
       env: {
         ...process.env,
         PATH: `${AS_BIN_DIR}${PATH_SEP}${process.env.PATH}`,
@@ -392,10 +394,7 @@ describe("pool auto-start of an offline member (real tmux + fake claude)", () =>
     if (!CAN_AUTOSTART) return;
     try { await asApi("/session/stop", "POST", { session: "as1" }); } catch {}
     Bun.spawnSync(["tmux", "kill-session", "-t", "as1"]);
-    proc?.kill();
-    for (const dir of [AS_DIR, AS_BIN_DIR]) {
-      if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
-    }
+    await stopServer(proc, AS_DIR, AS_BIN_DIR);
   });
 
   test.skipIf(!CAN_AUTOSTART)("dispatch auto-starts an offline member and delivers the prompt", async () => {
