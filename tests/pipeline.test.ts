@@ -1,5 +1,6 @@
 import { test, expect, describe, beforeAll, afterAll, beforeEach } from "bun:test";
 import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, readdirSync } from "fs";
+import { testRedis } from "./setup/redis";
 
 const TEST_PORT = 9878;
 const TEST_DIR = "/tmp/haiflow-pipeline-test";
@@ -60,7 +61,10 @@ beforeAll(async () => {
       PORT: String(TEST_PORT),
       HAIFLOW_DATA_DIR: TEST_DIR,
       HAIFLOW_API_KEY: TEST_API_KEY,
-      // No REDIS_URL — tests run with direct dispatch fallback
+      // REDIS_URL vem herdado do process.env: o preload da suite garante um
+      // Redis (do ambiente, local ou container descartavel). Quando nao houver
+      // nenhum, o servidor cai no fallback de despacho direto e os testes que
+      // dependem de persistencia pulam com motivo.
     },
     stdout: "ignore",
     stderr: "ignore",
@@ -86,7 +90,8 @@ afterAll(() => {
 // --- GET /pipeline ---
 
 describe("GET /pipeline", () => {
-  test("returns empty config when no pipeline.json", async () => {
+  // Asserta `redis === true`, ou seja, exige um Redis vivo por tras do servidor.
+  testRedis("returns empty config when no pipeline.json", async () => {
     // Remove pipeline.json if it exists
     const file = `${TEST_DIR}/pipeline.json`;
     if (existsSync(file)) rmSync(file);
@@ -396,7 +401,7 @@ describe("POST /publish", () => {
 // --- Pipeline introspection ---
 
 describe("pipeline introspection", () => {
-  test("recent events are tracked after publish", async () => {
+  testRedis("recent events are tracked after publish", async () => {
     writePipeline({
       topics: {
         "track.test": {
@@ -423,7 +428,7 @@ describe("pipeline introspection", () => {
 // --- Outbound webhooks ---
 
 describe("pipeline webhooks", () => {
-  test("fires outbound webhook when topic publishes", async () => {
+  testRedis("fires outbound webhook when topic publishes", async () => {
     // Start a tiny webhook receiver
     let received: any = null;
     const webhookServer = Bun.serve({
@@ -473,9 +478,9 @@ describe("pipeline webhooks", () => {
       // so the event lingered in the unprocessed set and was re-delivered on the
       // next restart. status "delivered" is exactly the proof the fix works:
       // finalizeEvent only removes an event from the unprocessed/replay set when
-      // its status leaves "published". This whole suite requires Redis (see the
-      // GET /pipeline test asserting redis === true), so assert unconditionally —
-      // a vacuous skip without Redis would make a green run meaningless.
+      // its status leaves "published". O teste exige Redis e o preload provisiona
+      // um; a asserção `redis === true` abaixo continua incondicional dentro do
+      // teste, para que um Redis ausente vire skip declarado e nunca verde vazio.
       const { data: pipeChk } = await api("/pipeline");
       expect(pipeChk.redis).toBe(true);
       const { data: ev } = await api("/events?limit=20");

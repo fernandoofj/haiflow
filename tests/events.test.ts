@@ -1,5 +1,6 @@
 import { test, expect, beforeEach, afterEach, describe } from "bun:test";
 import { EventBus, nextRetrySchedule } from "../src/events";
+import { describeRedis } from "./setup/redis";
 
 describe("nextRetrySchedule (webhook retry backoff)", () => {
   const NOW = 1_000_000_000_000;
@@ -62,7 +63,9 @@ describe("EventBus no-Redis fallback", () => {
   });
 });
 
-describe("EventBus", () => {
+// Este bloco mede persistencia de verdade: sem um Redis vivo nao ha o que
+// asserir, entao ele pula com motivo em vez de falhar (ver tests/setup/redis.ts).
+describeRedis("EventBus", () => {
   // --- markNonce (replay nonce) ---
 
   test("markNonce: fresh once, then duplicate", async () => {
