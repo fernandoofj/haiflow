@@ -1,6 +1,9 @@
 import { test, expect, describe, beforeAll, afterAll, beforeEach } from "bun:test";
 import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, readdirSync } from "fs";
+import { join } from "path";
 import { testRedis } from "./setup/redis";
+import { installShim } from "./fixtures/shim";
+import { SERVER_ENTRY, stopServer } from "./fixtures/server";
 
 const TEST_PORT = 9878;
 const TEST_DIR = "/tmp/haiflow-pipeline-test";
@@ -8,6 +11,15 @@ const TEST_API_KEY = "test-pipeline-key";
 const BASE = `http://localhost:${TEST_PORT}`;
 
 let server: ReturnType<typeof Bun.spawn>;
+
+// Publishing to a topic dispatches to its subscribers for real, so a
+// subscriber needs a pane. Without one the send fails and the server releases
+// the session to `offline` -- the dispatch assertions then read the machine,
+// not the pipeline. The fake tmux (tests/fixtures/fake-tmux.ts) provides the
+// pane hermetically, with no real tmux involved.
+const FAKE_TMUX = join(import.meta.dir, "fixtures", "fake-tmux.ts");
+const BIN_DIR = `/tmp/haiflow-pipeline-bin-${process.pid}`;
+const PATH_SEP = process.platform === "win32" ? ";" : ":";
 
 const authHeaders: Record<string, string> = { "Authorization": `Bearer ${TEST_API_KEY}` };
 
@@ -55,9 +67,13 @@ beforeAll(async () => {
   if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
   mkdirSync(TEST_DIR, { recursive: true });
 
-  server = Bun.spawn(["bun", "run", "src/index.ts"], {
+  if (existsSync(BIN_DIR)) rmSync(BIN_DIR, { recursive: true, force: true });
+  installShim(BIN_DIR, "tmux", FAKE_TMUX);
+
+  server = Bun.spawn([process.execPath, SERVER_ENTRY], {
     env: {
       ...process.env,
+      PATH: `${BIN_DIR}${PATH_SEP}${process.env.PATH}`,
       PORT: String(TEST_PORT),
       HAIFLOW_DATA_DIR: TEST_DIR,
       HAIFLOW_API_KEY: TEST_API_KEY,
@@ -80,9 +96,8 @@ beforeAll(async () => {
   throw new Error("Server failed to start");
 });
 
-afterAll(() => {
-  server?.kill();
-  if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+afterAll(async () => {
+  await stopServer(server, TEST_DIR, BIN_DIR);
 });
 
 // renderTemplate unit tests are in index.test.ts (imported from src/utils.ts)
@@ -170,7 +185,10 @@ describe("POST /publish", () => {
       emitters: {},
     });
 
-    // Create an idle subscriber session (without tmux — sendToTmux will fail but state should update)
+    // An idle subscriber with a pane (the fake tmux above): the send lands, so
+    // the session stays busy on the dispatched prompt. Note the state is NOT
+    // "busy" when the send fails -- the server deliberately releases it back to
+    // idle/offline so a prompt that never arrived cannot wedge the queue.
     writeState("sub-idle", { status: "idle", since: new Date().toISOString() });
 
     const { status, data } = await api("/publish", "POST", {
@@ -182,7 +200,7 @@ describe("POST /publish", () => {
     expect(data.published).toBe(true);
     expect(data.topic).toBe("test.topic");
 
-    // Subscriber state should now be busy (even though tmux send fails)
+    // Subscriber state should now be busy: the prompt actually landed.
     await Bun.sleep(100);
     const state = readState("sub-idle");
     expect(state.status).toBe("busy");

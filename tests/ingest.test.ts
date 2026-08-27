@@ -1,7 +1,10 @@
 import { test, expect, describe, beforeAll, afterAll } from "bun:test";
 import { mkdirSync, writeFileSync, existsSync, rmSync } from "fs";
 import { createHmac, randomUUID } from "crypto";
+import { join } from "path";
 import { testRedis } from "./setup/redis";
+import { installShim } from "./fixtures/shim";
+import { SERVER_ENTRY, removeDirs, stopServer } from "./fixtures/server";
 
 const TEST_PORT = 9884;
 const TEST_DIR = "/tmp/haiflow-ingest-test";
@@ -9,6 +12,18 @@ const TEST_API_KEY = "test-api-key";
 const BASE = `http://localhost:${TEST_PORT}`;
 
 let server: ReturnType<typeof Bun.spawn>;
+
+// The trigger target dispatches for real, so the seeded worker needs a pane to
+// receive the prompt. Without one `sendToTmux` fails, the server releases the
+// session to `offline`, and the ingest assertions read "offline" instead of
+// "busy" -- a red about the machine, not about the gateway. The fake tmux
+// (tests/fixtures/fake-tmux.ts, already used by pool/queue) supplies the pane
+// hermetically: no real tmux server, nothing spawned, and the same result on a
+// CI box with no tmux at all.
+const FAKE_TMUX = join(import.meta.dir, "fixtures", "fake-tmux.ts");
+const BIN_DIR = `/tmp/haiflow-ingest-bin-${process.pid}`;
+const PATH_SEP = process.platform === "win32" ? ";" : ":";
+const SHIMMED_PATH = () => `${BIN_DIR}${PATH_SEP}${process.env.PATH}`;
 
 function seedIdle(session: string) {
   const dir = `${TEST_DIR}/${session}`;
@@ -57,8 +72,14 @@ beforeAll(async () => {
   seedIdle("g-worker");
   seedIdle("gh-worker");
 
-  server = Bun.spawn(["bun", "run", "src/index.ts"], {
-    env: { ...process.env, PORT: String(TEST_PORT), HAIFLOW_DATA_DIR: TEST_DIR, HAIFLOW_API_KEY: TEST_API_KEY, HAIFLOW_GUARDRAILS: "false" },
+  if (existsSync(BIN_DIR)) rmSync(BIN_DIR, { recursive: true, force: true });
+  installShim(BIN_DIR, "tmux", FAKE_TMUX);
+
+  server = Bun.spawn([process.execPath, SERVER_ENTRY], {
+    env: {
+      ...process.env, PATH: SHIMMED_PATH(),
+      PORT: String(TEST_PORT), HAIFLOW_DATA_DIR: TEST_DIR, HAIFLOW_API_KEY: TEST_API_KEY, HAIFLOW_GUARDRAILS: "false",
+    },
     stdout: "ignore", stderr: "ignore",
   });
   for (let i = 0; i < 150; i++) {
@@ -68,9 +89,8 @@ beforeAll(async () => {
   throw new Error("Server failed to start");
 });
 
-afterAll(() => {
-  server?.kill();
-  if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+afterAll(async () => {
+  await stopServer(server, TEST_DIR, BIN_DIR);
 });
 
 describe("signed inbound webhook gateway", () => {
@@ -228,9 +248,10 @@ describe("ingest replay protection without Redis", () => {
     writeFileSync(`${NR_DIR}/g-worker/session-id`, "claude-g-worker");
     writeFileSync(`${NR_DIR}/g-worker/state.json`, JSON.stringify({ status: "idle", since: new Date().toISOString() }));
 
-    const proc = Bun.spawn(["bun", "run", "src/index.ts"], {
+    const proc = Bun.spawn([process.execPath, SERVER_ENTRY], {
       env: {
-        ...process.env, PORT: String(port), HAIFLOW_DATA_DIR: NR_DIR, HAIFLOW_API_KEY: TEST_API_KEY,
+        ...process.env, PATH: SHIMMED_PATH(),
+        PORT: String(port), HAIFLOW_DATA_DIR: NR_DIR, HAIFLOW_API_KEY: TEST_API_KEY,
         HAIFLOW_GUARDRAILS: "false",
         // Point at a port that is never Redis so eventBus.connected stays false.
         REDIS_URL: "redis://127.0.0.1:1",
@@ -242,11 +263,11 @@ describe("ingest replay protection without Redis", () => {
       try { if ((await fetch(`http://localhost:${port}/health`)).ok) return proc; } catch {}
       await Bun.sleep(100);
     }
-    proc.kill();
+    await stopServer(proc);
     throw new Error("server failed to start");
   }
 
-  afterAll(() => { if (existsSync(NR_DIR)) rmSync(NR_DIR, { recursive: true }); });
+  afterAll(() => { removeDirs(NR_DIR); });
 
   test("fails closed with 503 when Redis is unavailable", async () => {
     const proc = await bootIngestServer(9885, false);
@@ -259,7 +280,9 @@ describe("ingest replay protection without Redis", () => {
       });
       expect(res.status).toBe(503);
     } finally {
-      proc.kill();
+      // Await the exit: the next boot re-creates NR_DIR, and a server still
+      // holding it makes that rm fail with EBUSY.
+      await stopServer(proc);
     }
   });
 
@@ -274,7 +297,7 @@ describe("ingest replay protection without Redis", () => {
       });
       expect(res.status).toBe(200);
     } finally {
-      proc.kill();
+      await stopServer(proc);
     }
   });
 });
@@ -300,9 +323,10 @@ describe("ingest rate limiting", () => {
       generic: { scheme: "hmac-sha256", secret: GENERIC_SECRET, target: "trigger", session: "g-worker" },
       other: { scheme: "hmac-sha256", secret: GENERIC_SECRET, target: "trigger", session: "g-worker" },
     }));
-    proc = Bun.spawn(["bun", "run", "src/index.ts"], {
+    proc = Bun.spawn([process.execPath, SERVER_ENTRY], {
       env: {
-        ...process.env, PORT: String(RL_PORT), HAIFLOW_DATA_DIR: RL_DIR, HAIFLOW_API_KEY: TEST_API_KEY,
+        ...process.env, PATH: SHIMMED_PATH(),
+        PORT: String(RL_PORT), HAIFLOW_DATA_DIR: RL_DIR, HAIFLOW_API_KEY: TEST_API_KEY,
         HAIFLOW_GUARDRAILS: "false", HAIFLOW_INGEST_RATE_PER_MIN: "2",
       },
       stdout: "ignore", stderr: "ignore",
@@ -314,7 +338,7 @@ describe("ingest rate limiting", () => {
     throw new Error("server failed to start");
   });
 
-  afterAll(() => { proc?.kill(); if (existsSync(RL_DIR)) rmSync(RL_DIR, { recursive: true }); });
+  afterAll(async () => { await stopServer(proc, RL_DIR); });
 
   test("returns 429 with Retry-After once the per-source limit is exceeded", async () => {
     const s1 = await hit("generic");
