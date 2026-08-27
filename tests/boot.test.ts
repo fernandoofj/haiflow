@@ -1,12 +1,13 @@
 import { test, expect, describe, afterAll } from "bun:test";
 import { existsSync, writeFileSync, mkdirSync, rmSync, unlinkSync, utimesSync } from "fs";
 import { randomUUID } from "crypto";
+import { SERVER_ENTRY, removeDirs, stopServer } from "./fixtures/server";
 
 const TEST_DIR = "/tmp/haiflow-boot-test";
 const PORT = 9888;
 
 afterAll(() => {
-  if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+  removeDirs(TEST_DIR);
 });
 
 describe("startup prompt-file sweep", () => {
@@ -25,7 +26,7 @@ describe("startup prompt-file sweep", () => {
     if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
     mkdirSync(TEST_DIR, { recursive: true });
 
-    const proc = Bun.spawn(["bun", "run", "src/index.ts"], {
+    const proc = Bun.spawn([process.execPath, SERVER_ENTRY], {
       env: {
         ...process.env, PORT: String(PORT), HAIFLOW_DATA_DIR: TEST_DIR,
         HAIFLOW_API_KEY: "boot-test-key", HAIFLOW_GUARDRAILS: "false",
@@ -44,7 +45,9 @@ describe("startup prompt-file sweep", () => {
       expect(existsSync(stale)).toBe(false); // stale -> reaped
       expect(existsSync(fresh)).toBe(true);  // in-flight -> preserved
     } finally {
-      proc.kill();
+      // Wait for the exit before afterAll's rm: a still-live server holds
+      // TEST_DIR open and Windows answers the rm with EBUSY.
+      await stopServer(proc);
       for (const f of [stale, fresh]) { try { unlinkSync(f); } catch {} }
     }
   });

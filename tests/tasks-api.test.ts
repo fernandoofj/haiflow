@@ -1,5 +1,6 @@
 import { test, expect, describe, beforeAll, afterAll } from "bun:test";
 import { mkdirSync, writeFileSync, existsSync, rmSync } from "fs";
+import { SERVER_ENTRY, stopServer } from "./fixtures/server";
 
 const TEST_PORT = 9879;
 const TEST_DIR = "/tmp/haiflow-tasks-test";
@@ -46,7 +47,7 @@ function writeTranscript(name: string): string {
 
 beforeAll(async () => {
   if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
-  server = Bun.spawn(["bun", "run", "src/index.ts"], {
+  server = Bun.spawn([process.execPath, SERVER_ENTRY], {
     env: { ...process.env, PORT: String(TEST_PORT), HAIFLOW_DATA_DIR: TEST_DIR, HAIFLOW_API_KEY: TEST_API_KEY, HAIFLOW_GUARDRAILS: "false" },
     stdout: "ignore",
     stderr: "ignore",
@@ -58,10 +59,8 @@ beforeAll(async () => {
   throw new Error("Server failed to start");
 });
 
-afterAll(() => {
-  server?.kill();
-  if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
-  if (existsSync(TRANSCRIPT_DIR)) rmSync(TRANSCRIPT_DIR, { recursive: true });
+afterAll(async () => {
+  await stopServer(server, TEST_DIR, TRANSCRIPT_DIR);
 });
 
 describe("task ledger endpoints", () => {
@@ -232,7 +231,7 @@ describe("GET /usage/window alert threshold", () => {
       status: "busy", since: new Date().toISOString(), currentTaskId: "u-task-1", currentPrompt: "work",
     }));
 
-    proc = Bun.spawn(["bun", "run", "src/index.ts"], {
+    proc = Bun.spawn([process.execPath, SERVER_ENTRY], {
       env: {
         ...process.env, PORT: String(ALERT_PORT), HAIFLOW_DATA_DIR: ALERT_DIR,
         HAIFLOW_API_KEY: TEST_API_KEY, HAIFLOW_GUARDRAILS: "false",
@@ -254,9 +253,8 @@ describe("GET /usage/window alert threshold", () => {
     });
   });
 
-  afterAll(() => {
-    proc?.kill();
-    if (existsSync(ALERT_DIR)) rmSync(ALERT_DIR, { recursive: true });
+  afterAll(async () => {
+    await stopServer(proc, ALERT_DIR);
   });
 
   test("alert=true once the 5h token total crosses the threshold", async () => {

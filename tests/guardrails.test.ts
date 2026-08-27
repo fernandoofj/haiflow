@@ -1,5 +1,6 @@
 import { test, expect, describe, afterEach } from "bun:test";
 import { existsSync, readFileSync, rmSync, mkdirSync } from "fs";
+import { SERVER_ENTRY, stopServer } from "./fixtures/server";
 
 const TEST_API_KEY = "test-api-key";
 
@@ -7,6 +8,9 @@ let nextPort = 9950;
 let activeServer: ReturnType<typeof Bun.spawn> | null = null;
 let activeHome: string | null = null;
 let activeDataDir: string | null = null;
+// The restart case below boots a second server on its own data dir. Tracked
+// here so teardown removes it too -- it used to be left behind on every run.
+let extraDataDir: string | null = null;
 
 async function startServer(extraEnv: Record<string, string>): Promise<{ base: string; home: string }> {
   const port = nextPort++;
@@ -16,7 +20,7 @@ async function startServer(extraEnv: Record<string, string>): Promise<{ base: st
   if (existsSync(dataDir)) rmSync(dataDir, { recursive: true });
   mkdirSync(home, { recursive: true });
 
-  activeServer = Bun.spawn(["bun", "run", "src/index.ts"], {
+  activeServer = Bun.spawn([process.execPath, SERVER_ENTRY], {
     env: {
       ...process.env,
       PORT: String(port),
@@ -43,16 +47,16 @@ async function startServer(extraEnv: Record<string, string>): Promise<{ base: st
 }
 
 afterEach(async () => {
-  activeServer?.kill();
-  activeServer = null;
   // The install happens after server_started is logged, so give it a moment
   // to complete before we tear down.
   await Bun.sleep(150);
-  for (const dir of [activeHome, activeDataDir]) {
-    if (dir && existsSync(dir)) rmSync(dir, { recursive: true });
-  }
+  // stopServer waits for the process to actually exit before removing the
+  // dirs; a bare kill() leaves it alive holding them, and the rm gets EBUSY.
+  await stopServer(activeServer, activeHome, activeDataDir, extraDataDir);
+  activeServer = null;
   activeHome = null;
   activeDataDir = null;
+  extraDataDir = null;
 });
 
 describe("guardrail skill installation", () => {
@@ -99,13 +103,14 @@ describe("guardrail skill installation", () => {
 
     // Restart the server with the same HOME — skill should still land cleanly,
     // even though the file already exists.
-    activeServer?.kill();
+    await stopServer(activeServer);
     await Bun.sleep(150);
-    activeServer = Bun.spawn(["bun", "run", "src/index.ts"], {
+    extraDataDir = `${activeDataDir}-2`;
+    activeServer = Bun.spawn([process.execPath, SERVER_ENTRY], {
       env: {
         ...process.env,
         PORT: String(nextPort++),
-        HAIFLOW_DATA_DIR: `${activeDataDir}-2`,
+        HAIFLOW_DATA_DIR: extraDataDir,
         HAIFLOW_API_KEY: TEST_API_KEY,
         HOME: home,
       },

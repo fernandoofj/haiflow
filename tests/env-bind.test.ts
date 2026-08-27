@@ -1,5 +1,6 @@
 import { test, expect, describe, afterEach } from "bun:test";
 import { existsSync, rmSync } from "fs";
+import { SERVER_ENTRY, stopServer } from "./fixtures/server";
 
 // A strong, non-placeholder key so production's key check passes by default.
 const STRONG_KEY = "k".repeat(40);
@@ -21,7 +22,7 @@ async function boot(extraEnv: Record<string, string>): Promise<Boot> {
   if (existsSync(dataDir)) rmSync(dataDir, { recursive: true });
   activeDir = dataDir;
 
-  const proc = Bun.spawn(["bun", "run", "src/index.ts"], {
+  const proc = Bun.spawn([process.execPath, SERVER_ENTRY], {
     env: {
       ...process.env,
       PORT: String(port),
@@ -58,10 +59,11 @@ async function boot(extraEnv: Record<string, string>): Promise<Boot> {
   return { ok: false, exitCode: proc.exitCode ?? -1, stderr };
 }
 
-afterEach(() => {
-  active?.kill();
+afterEach(async () => {
+  // Await the exit before the rm: a server that is merely signalled still holds
+  // its data dir, and Windows answers the rm with EBUSY.
+  await stopServer(active, activeDir);
   active = null;
-  if (activeDir && existsSync(activeDir)) rmSync(activeDir, { recursive: true });
   activeDir = null;
 });
 

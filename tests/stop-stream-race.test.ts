@@ -19,9 +19,7 @@
 
 import { test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdirSync, writeFileSync, existsSync, rmSync, readFileSync, appendFileSync } from "fs";
-import { resolve } from "path";
-
-const SERVER_ENTRY = resolve(import.meta.dir, "../src/index.ts");
+import { SERVER_ENTRY, stopServer } from "./fixtures/server";
 
 const TEST_PORT = 9893;
 const TEST_DIR = "/tmp/haiflow-stop-race-test";
@@ -86,7 +84,7 @@ beforeAll(async () => {
     if (existsSync(dir)) rmSync(dir, { recursive: true });
     mkdirSync(dir, { recursive: true });
   }
-  server = Bun.spawn(["bun", "run", SERVER_ENTRY], {
+  server = Bun.spawn([process.execPath, SERVER_ENTRY], {
     cwd: "/tmp",
     env: {
       ...process.env,
@@ -111,11 +109,8 @@ beforeAll(async () => {
   throw new Error("Server failed to start");
 });
 
-afterAll(() => {
-  server?.kill();
-  for (const dir of [TEST_DIR, TRANSCRIIPT_DIR]) {
-    if (existsSync(dir)) rmSync(dir, { recursive: true });
-  }
+afterAll(async () => {
+  await stopServer(server, TEST_DIR, TRANSCRIIPT_DIR);
 });
 
 // --- 1. the merge: a streamed message the transcript pass missed ------------

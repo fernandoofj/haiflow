@@ -1,5 +1,6 @@
 import { test, expect, describe, beforeAll, afterAll } from "bun:test";
 import { existsSync, rmSync, mkdirSync, writeFileSync } from "fs";
+import { SERVER_ENTRY, stopServer } from "./fixtures/server";
 
 const TEST_PORT = 9877;
 const TEST_DIR = "/tmp/haiflow-auth-test";
@@ -33,7 +34,7 @@ function writeState(session: string, state: object) {
 beforeAll(async () => {
   if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
 
-  server = Bun.spawn(["bun", "run", "src/index.ts"], {
+  server = Bun.spawn([process.execPath, SERVER_ENTRY], {
     env: { ...process.env, PORT: String(TEST_PORT), HAIFLOW_DATA_DIR: TEST_DIR, HAIFLOW_API_KEY: API_KEY },
     stdout: "ignore",
     stderr: "ignore",
@@ -49,9 +50,8 @@ beforeAll(async () => {
   throw new Error("Server failed to start");
 });
 
-afterAll(() => {
-  server?.kill();
-  if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
+afterAll(async () => {
+  await stopServer(server, TEST_DIR);
 });
 
 // --- Auth: public routes require token ---
