@@ -1,13 +1,8 @@
 import { test, expect, describe, beforeAll, afterAll } from "bun:test";
 import { mkdirSync, writeFileSync, existsSync, rmSync } from "fs";
-import { join, resolve } from "path";
+import { join } from "path";
 import { installShim } from "./fixtures/shim";
-
-// Absolute entry, spawned with the running bun binary rather than via
-// `bun run`: `bun run` interposes a launcher process, and killing the launcher
-// leaves the real server alive holding its data dir open — EBUSY on the
-// afterAll cleanup here, and a stray listening port everywhere else.
-const SERVER_ENTRY = resolve(import.meta.dir, "../src/index.ts");
+import { SERVER_ENTRY, stopServer } from "./fixtures/server";
 
 const TEST_PORT = 9882;
 const TEST_DIR = "/tmp/haiflow-queue-test";
@@ -65,14 +60,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  server?.kill();
-  // Wait for the process to really be gone before deleting the dirs it holds
-  // open: on Windows an rm against a live server's data dir answers EBUSY. The
-  // retries cover the short window where the handle outlives the process.
-  await server?.exited;
-  for (const dir of [TEST_DIR, BIN_DIR]) {
-    if (existsSync(dir)) rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
-  }
+  await stopServer(server, TEST_DIR, BIN_DIR);
 });
 
 describe("smart queue", () => {

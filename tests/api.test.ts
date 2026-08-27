@@ -1,9 +1,7 @@
 import { test, expect, describe, beforeAll, afterAll, beforeEach } from "bun:test";
 import { mkdirSync, writeFileSync, existsSync, rmSync, unlinkSync } from "fs";
-import { resolve, join, delimiter } from "path";
-
-// Absolute entry so the server can be spawned from a neutral cwd.
-const SERVER_ENTRY = resolve(import.meta.dir, "../src/index.ts");
+import { join, delimiter } from "path";
+import { SERVER_ENTRY, stopServer } from "./fixtures/server";
 
 // PATH with every directory that carries a `claude` executable removed. The
 // server's fast-fail guard is `Bun.which("claude")`, so this is what makes
@@ -60,11 +58,8 @@ function writeResponse(session: string, taskId: string, data: object) {
 beforeAll(async () => {
   if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true });
 
-  // Spawn the entry with the running bun binary rather than `bun run <entry>`:
-  // `bun run` interposes a launcher process, and killing that launcher leaves
-  // the actual server alive holding TEST_DIR open. On Windows that turns every
-  // afterAll cleanup into EBUSY; everywhere it leaks a listening port into the
-  // next run. Spawned this way, the process we hold IS the server.
+  // Spawned via the fixture's SERVER_ENTRY + the running bun binary; see
+  // tests/fixtures/server.ts for why `bun run` is wrong here.
   server = Bun.spawn([process.execPath, SERVER_ENTRY], {
     // Neutral cwd so the cwd-optional /session/start fallback resolves to /tmp
     // (a fast-failing dir in tests) instead of the repo root.
@@ -88,12 +83,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  server?.kill();
-  // Wait for the process to really be gone before deleting its data dir: while
-  // it lives it holds an open handle on TEST_DIR, and Windows answers rm with
-  // EBUSY. The retries cover the short window where the handle outlives exit.
-  await server?.exited;
-  if (existsSync(TEST_DIR)) rmSync(TEST_DIR, { recursive: true, maxRetries: 20, retryDelay: 100 });
+  await stopServer(server, TEST_DIR);
 });
 
 // --- Health ---

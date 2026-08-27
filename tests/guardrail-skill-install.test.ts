@@ -1,11 +1,7 @@
 import { test, expect, describe, afterAll } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "fs";
 import { resolve } from "path";
-
-// Absolute entry spawned with the running bun binary, never `bun run`: the
-// launcher `bun run` interposes survives a kill of the process we hold, and the
-// real server keeps the data dir open. Same reason as watchdog.test.ts.
-const SERVER_ENTRY = resolve(import.meta.dir, "../src/index.ts");
+import { SERVER_ENTRY, removeDirs, stopServer } from "./fixtures/server";
 
 const TEST_PORT = 9893;
 const TEST_DIR = "/tmp/haiflow-skill-install-test";
@@ -41,15 +37,12 @@ async function bootOnce(): Promise<void> {
     }
     throw new Error("Server failed to start");
   } finally {
-    proc.kill();
-    await proc.exited;
+    await stopServer(proc);
   }
 }
 
 afterAll(() => {
-  if (existsSync(TEST_DIR)) {
-    rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
-  }
+  removeDirs(TEST_DIR);
 });
 
 // The server installs its guardrail skill into ~/.claude/skills at boot. That
