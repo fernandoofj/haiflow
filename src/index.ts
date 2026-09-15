@@ -2,7 +2,7 @@ import { readFileSync, existsSync, mkdirSync, readdirSync, writeFileSync, unlink
 import type { ServerWebSocket, Subprocess } from "bun";
 import {
   sanitizeSession, sanitizeId, generateId, prefixedId, tmuxName, sanitizeModel,
-  validateStructural,
+  validateStructural, hookSessionFromHeaders, claudeSessionArgv,
   isAllowedTranscriptPath, renderTemplate, recoverSessionPatch,
   checkRateLimit, type RateWindow,
 } from "./utils";
@@ -982,6 +982,43 @@ function findSessionByClaudeId(claudeSessionId: string): string | null {
   return null;
 }
 
+/**
+ * A sessao a quem este hook pertence.
+ *
+ * Com o header, vale o NOME que o proprio Claude carrega (ver SESSION_HEADER em
+ * utils.ts), e o id dele e religado a essa sessao: quando e o primeiro hook,
+ * quando o id muda (/clear e compact geram id novo) e quando outra sessao o
+ * tinha por engano -- que e o estado que a adivinhacao antiga deixava.
+ *
+ * Sem o header (tmux subido antes desta correcao), segue a busca pelo id, como
+ * sempre foi. Header com sessao que nao existe nao cai na busca: o hook disse
+ * de quem era, e chutar outra dona e exatamente o defeito que isto corrige.
+ */
+function resolveHookSession(req: Request, claudeId: unknown, event: string): string | null {
+  const id = typeof claudeId === "string" && claudeId ? claudeId : null;
+  const declared = hookSessionFromHeaders(req.headers);
+  if (!declared) return id ? findSessionByClaudeId(id) : null;
+
+  if (!existsSync(`${BASE_DIR}/${declared}/state.json`)) {
+    log("warn", "hook_unknown_session", { event, session: declared, claudeId: id });
+    return null;
+  }
+  if (id) {
+    const previous = getSessionId(declared);
+    if (previous !== id) {
+      const holder = findSessionByClaudeId(id);
+      if (holder && holder !== declared) setSessionId(holder, null);
+      setSessionId(declared, id);
+      if (holder && holder !== declared) {
+        log("warn", "hook_session_relinked", { event, session: declared, claudeId: id, previous, takenFrom: holder });
+      } else if (previous) {
+        log("info", "hook_session_relinked", { event, session: declared, claudeId: id, previous });
+      }
+    }
+  }
+  return declared;
+}
+
 function sendToTmux(session: string, prompt: string): boolean {
   // Hard structural blocks — these break out of the orchestrator itself
   const check = validateStructural(prompt);
@@ -1343,15 +1380,7 @@ async function startClaudeSession(
     // fica EXATAMENTE como era -- nao inventar um default aqui e o ponto: um
     // default escondido no gateway seria a mesma classe de problema que o
     // `auto` implicito, so que mais dificil de enxergar.
-    const argv = [
-      "tmux", "new-session", "-d", "-s", target, "-c", cwd,
-      "-e", `HAIFLOW=1`,
-      "-e", `HAIFLOW_PORT=${PORT}`,
-      "claude", "--permission-mode", "auto",
-    ];
-    if (model) argv.push("--model", model);
-
-    const result = Bun.spawnSync(argv);
+    const result = Bun.spawnSync(claudeSessionArgv(target, cwd, PORT, session, model));
 
     if (result.exitCode !== 0) {
       log("error", "session_start_failed", { session, error: result.stderr.toString(), model });
@@ -2721,13 +2750,18 @@ const server = Bun.serve({
         const body = await readJson(req);
         if (!body) return Response.json({ error: "Invalid or empty JSON body" }, { status: 400 });
         const claudeId = body.session_id;
-        let session = findSessionByClaudeId(claudeId);
+        let session = resolveHookSession(req, claudeId, "session-start");
 
-        if (!session) {
+        // Adivinhacao so para quem nao declarou nome (tmux subido antes da
+        // correcao). Com varias sessoes subindo juntas ela liga o Claude errado,
+        // por isso fica registrada em warn: se aparecer depois do deploy, ha
+        // sessao sem identidade em uso.
+        if (!session && !hookSessionFromHeaders(req.headers)) {
           const sessions = listSessions();
           for (const s of sessions) {
             if (!getSessionId(s.session) && isTmuxRunning(s.session)) {
               session = s.session;
+              log("warn", "session_start_linked_by_guess", { session, claudeId });
               break;
             }
           }
@@ -2751,7 +2785,7 @@ const server = Bun.serve({
         if (err) return err;
         const body = await readJson(req);
         if (!body) return Response.json({ error: "Invalid or empty JSON body" }, { status: 400 });
-        const session = findSessionByClaudeId(body.session_id);
+        const session = resolveHookSession(req, body.session_id, "prompt");
         if (!session) return Response.json({ ok: true });
 
         const state = readState(session);
@@ -2777,7 +2811,7 @@ const server = Bun.serve({
         if (err) return err;
         const body = await readJson(req);
         if (!body) return Response.json({ error: "Invalid or empty JSON body" }, { status: 400 });
-        const session = findSessionByClaudeId(body.session_id);
+        const session = resolveHookSession(req, body.session_id, "message-display");
         if (!session) return Response.json({ ok: true });
 
         const state = readState(session);
@@ -2804,7 +2838,7 @@ const server = Bun.serve({
         if (err) return err;
         const body = await readJson(req);
         if (!body) return Response.json({ error: "Invalid or empty JSON body" }, { status: 400 });
-        const session = findSessionByClaudeId(body.session_id);
+        const session = resolveHookSession(req, body.session_id, "stop");
         if (!session) return Response.json({ ok: true });
 
         const state = readState(session);
@@ -2906,7 +2940,7 @@ const server = Bun.serve({
         if (err) return err;
         const body = await readJson(req);
         if (!body) return Response.json({ error: "Invalid or empty JSON body" }, { status: 400 });
-        const session = findSessionByClaudeId(body.session_id);
+        const session = resolveHookSession(req, body.session_id, "session-end");
         if (!session) return Response.json({ ok: true });
 
         const reason = body.reason;
@@ -2926,7 +2960,7 @@ const server = Bun.serve({
         if (err) return err;
         const body = await readJson(req);
         if (!body) return Response.json({ error: "Invalid or empty JSON body" }, { status: 400 });
-        const session = findSessionByClaudeId(body.session_id);
+        const session = resolveHookSession(req, body.session_id, "notification");
         if (!session) return Response.json({ ok: true });
 
         // Only treat a notification as a wedge signal while the session is

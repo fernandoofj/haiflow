@@ -22,6 +22,52 @@ export function sanitizeSession(name: string): string {
   return name.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, MAX_SESSION_NAME) || "default";
 }
 
+// Identidade da sessao nos hooks.
+//
+// O hook do Claude so manda o `session_id` DELE, que o haiflow ainda nao
+// conhece quando o SessionStart chega. Ate aqui a ligacao era por adivinhacao:
+// "a primeira sessao sem id com tmux vivo". Com varias sessoes subindo no mesmo
+// segundo, os hooks de um Claude caiam no estado de outra sessao. Medido em
+// 15/09/2026 (Falcon, 3 sessoes em 0,4 s no mesmo cwd): uma sessao ficou
+// `busy` sem tarefa com o prompt de outra, a fila dela nunca drenou (falso
+// "nunca entregou"), e o Stop de uma terceira nunca chegou nela.
+//
+// A correcao e o nome viajar junto: o tmux sobe com `HAIFLOW_SESSION=<nome>`,
+// o `hooks/forward.sh` repassa no header, e o servidor resolve por ele.
+export const SESSION_HEADER = "x-haiflow-session";
+
+/** O nome que o hook declarou, saneado; `null` quando nao declarou nada. */
+export function hookSessionFromHeaders(headers: Headers): string | null {
+  const raw = headers.get(SESSION_HEADER);
+  if (!raw) return null;
+  const clean = raw.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, MAX_SESSION_NAME);
+  return clean || null;
+}
+
+/**
+ * A linha de comando que sobe o Claude de uma sessao.
+ *
+ * `HAIFLOW_SESSION` e o que da identidade aos hooks (ver SESSION_HEADER). O
+ * `--model` so entra quando houve escolha (CF-315).
+ */
+export function claudeSessionArgv(
+  target: string,
+  cwd: string,
+  port: number | string,
+  session: string,
+  model: string | null,
+): string[] {
+  const argv = [
+    "tmux", "new-session", "-d", "-s", target, "-c", cwd,
+    "-e", `HAIFLOW=1`,
+    "-e", `HAIFLOW_PORT=${port}`,
+    "-e", `HAIFLOW_SESSION=${session}`,
+    "claude", "--permission-mode", "auto",
+  ];
+  if (model) argv.push("--model", model);
+  return argv;
+}
+
 // CF-315: o modelo vira ARGUMENTO da linha de comando do `claude`, e chega de
 // fora. Nao ha shell no meio (Bun.spawnSync recebe array), entao o risco nao e
 // injecao de shell -- e injecao de FLAG: um "modelo" chamado
