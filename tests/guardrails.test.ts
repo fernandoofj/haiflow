@@ -87,7 +87,10 @@ describe("guardrail skill installation", () => {
     await Bun.sleep(2000);
     const targetPath = `${home}/.claude/skills/haiflow-guardrails/SKILL.md`;
     expect(existsSync(targetPath)).toBe(false);
-  });
+    // O teto padrao do bun (5 s) nao cabe as esperas deste teste: o boot pode
+    // levar ate 15 s (startServer) e a observacao soma 2 s fixos. No Windows o
+    // boot sozinho leva ~3 s, e o teste morria por relogio, nao por instalar.
+  }, 20_000);
 
   test("idempotent: existing skill file is overwritten with the current template", async () => {
     const { home } = await startServer({});
