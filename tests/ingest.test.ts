@@ -2,7 +2,7 @@ import { test, expect, describe, beforeAll, afterAll } from "bun:test";
 import { mkdirSync, writeFileSync, existsSync, rmSync } from "fs";
 import { createHmac, randomUUID } from "crypto";
 import { join } from "path";
-import { testRedis } from "./setup/redis";
+import { testRedis, redisAvailable } from "./setup/redis";
 import { installShim } from "./fixtures/shim";
 import { SERVER_ENTRY, removeDirs, stopServer } from "./fixtures/server";
 
@@ -79,6 +79,11 @@ beforeAll(async () => {
     env: {
       ...process.env, PATH: SHIMMED_PATH(),
       PORT: String(TEST_PORT), HAIFLOW_DATA_DIR: TEST_DIR, HAIFLOW_API_KEY: TEST_API_KEY, HAIFLOW_GUARDRAILS: "false",
+      // Sem Redis o ingest falha FECHADO (503, protecao contra replay) antes de
+      // verificar assinatura -- e os testes de assinatura e de moldura liam
+      // "503" em vez do que medem. So sem Redis a trava abre; com Redis ela
+      // continua fechada e os testes de replay (`testRedis`) valem de verdade.
+      HAIFLOW_INGEST_ALLOW_WITHOUT_REDIS: redisAvailable ? "false" : "true",
     },
     stdout: "ignore", stderr: "ignore",
   });

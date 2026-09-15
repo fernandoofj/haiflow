@@ -252,5 +252,8 @@ test("a stream that flows forever without closing hits the absolute cap", async 
   const saved = savedResponse("forever", taskId);
   expect(saved.error).toBe("incomplete_stream");
   await pinger;
-});
+  // O desenho do teste passa de 5 s (o teto padrao do bun): o Stop espera o
+  // teto de 4000 ms e o pinger continua ate ~4900 ms, mais o custo de cada POST.
+  // Morria por relogio do runner, nao pelo que mede.
+}, 15_000);
 
