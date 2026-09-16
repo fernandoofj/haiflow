@@ -325,6 +325,10 @@ interface State {
   currentPrompt?: string;
   currentTaskId?: string;
   currentChain?: string[];
+  //: Arquivo temporario do prompt grande (ver `sendToTmux`). Fica no estado
+  //: para ser apagado quando a TAREFA acaba, e nao por relogio: o Claude pagina
+  //: um prompt de centenas de KB, e apagar por baixo dele perde o turno.
+  currentPromptFile?: string;
   queueLength: number;
   // CF-315: o modelo com que ESTA sessao subiu.
   //
@@ -1037,30 +1041,69 @@ function sendToTmux(session: string, prompt: string): boolean {
     const tmpFile = `/tmp/haiflow-prompt-${crypto.randomUUID()}.txt`;
     writeFileSync(tmpFile, fullPrompt, { mode: 0o600 });
     const shortPrompt = `Read the file ${tmpFile} and follow the instructions in it exactly.`;
+    // O arquivo morre com a TAREFA (Stop/cancel/watchdog/stop de sessao), nao
+    // por relogio.
+    //
+    // Era `setTimeout(unlink, 60_000)`, e 60 s nao chegam para prompt grande: o
+    // Claude pagina um arquivo de centenas de KB e o apagam por baixo dele.
+    // Medido em 16/09/2026 (run `dba5dd0c`, turno 2, prompt de ~156 KB em 444
+    // linhas, varias linhas acima de 5 KB): a resposta foi *"I can't complete
+    // this one -- the file was deleted out from under me partway through
+    // reading it"*. O turno custou uma chamada Opus inteira e voltou sem JSON
+    // nenhum, levando junto a tentativa de reparo.
+    writeState(session, { currentPromptFile: tmpFile });
     const ok = typeThenSubmit(target, shortPrompt);
-    // Clean up temp file after a delay (give Claude time to read it)
-    setTimeout(() => { try { unlinkSync(tmpFile); } catch {} }, 60_000);
+    if (!ok) descartarArquivoDoPrompt(session);
+    // Rede de seguranca: se o Stop nunca chegar, o arquivo ainda sai -- pelo
+    // prazo da tarefa, nao por 60 s. A varredura de boot cobre o resto.
+    setTimeout(() => { try { unlinkSync(tmpFile); } catch {} }, PROMPT_FILE_MAX_MS);
     return ok;
   }
 
   return typeThenSubmit(target, fullPrompt);
 }
 
-// Large-prompt temp files (above) are normally removed by a 60s timer, but that
-// timer is lost on crash/restart, leaking plaintext prompts in /tmp. Sweep any
-// leftovers on boot. Returns the number removed.
-// A prompt temp file is kept alive for 60s so Claude can read it. Only sweep
-// files comfortably past that window (2x), so this boot sweep never deletes a
-// concurrently-running or just-restarted instance's in-flight prompt.
+/** Apaga o arquivo temporario do prompt desta sessao, se houver. Idempotente. */
+function descartarArquivoDoPrompt(session: string): void {
+  const arquivo = readState(session).currentPromptFile;
+  if (!arquivo) return;
+  try { unlinkSync(arquivo); } catch {}
+  writeState(session, { currentPromptFile: undefined });
+}
+
+//: Teto da rede de seguranca do arquivo de prompt: o prazo da tarefa mais uma
+//: folga, nunca menos. Com `HAIFLOW_TASK_TIMEOUT_SEC` desligado, uma hora.
+const PROMPT_FILE_MAX_MS = TASK_TIMEOUT_SEC > 0 ? (TASK_TIMEOUT_SEC + 300) * 1000 : 3_600_000;
+
+// Large-prompt temp files (above) normally die WITH THE TASK (Stop hook), and a
+// safety timer covers a Stop that never comes. Both are lost on crash/restart,
+// leaking plaintext prompts in /tmp, so sweep leftovers on boot. Returns the
+// number removed.
 const PROMPT_FILE_STALE_MS = 120_000;
+
+/** Os arquivos de prompt que alguma sessao declara estar usando AGORA. */
+function arquivosDePromptEmUso(): Set<string> {
+  const emUso = new Set<string>();
+  for (const { session } of listSessions()) {
+    const arquivo = readState(session).currentPromptFile;
+    if (arquivo) emUso.add(arquivo);
+  }
+  return emUso;
+}
 
 function sweepStalePromptFiles(): number {
   let removed = 0;
   try {
     const now = Date.now();
+    // O tmux SOBREVIVE a um restart do gateway: uma tarefa pode estar lendo o
+    // arquivo dela agora, com mtime de horas atras (prompt grande, leitura
+    // paginada). Idade sozinha nao distingue "vazou" de "em uso" -- quem
+    // distingue e o `currentPromptFile` do estado da sessao.
+    const emUso = arquivosDePromptEmUso();
     for (const f of readdirSync("/tmp")) {
       if (!f.startsWith("haiflow-prompt-") || !f.endsWith(".txt")) continue;
       const path = `/tmp/${f}`;
+      if (emUso.has(path)) continue;
       try {
         if (now - statSync(path).mtimeMs < PROMPT_FILE_STALE_MS) continue;
         unlinkSync(path);
@@ -2687,6 +2730,7 @@ const server = Bun.serve({
           sendInterrupt(session, "escape");
           saveResponse(session, id, state.currentPrompt, undefined, "[haiflow] task cancelled by operator");
           recordTaskFinish({ id, session, status: "cancelled", error: "cancelled by operator" });
+          descartarArquivoDoPrompt(session);
           writeState(session, {
             status: "idle", since: new Date().toISOString(),
             waiting: false, waitingMessage: undefined, waitingSince: undefined, deadlineAt: undefined,
@@ -2904,6 +2948,9 @@ const server = Bun.serve({
           }
         }
 
+        // A tarefa acabou: o arquivo do prompt sai com ela (antes de liberar a
+        // sessao, para o proximo prompt nunca herdar o caminho do anterior).
+        descartarArquivoDoPrompt(session);
         writeState(session, {
           status: "idle", since: new Date().toISOString(),
           waiting: false, waitingMessage: undefined, waitingSince: undefined, deadlineAt: undefined,
@@ -3379,6 +3426,7 @@ const watchdogTimer = setInterval(() => {
         }
         recordTaskFinish({ id: state.currentTaskId, session, status: "failed", error: "watchdog:tmux_died" });
       }
+      descartarArquivoDoPrompt(session);
       writeState(session, {
         status: "offline", since: new Date().toISOString(),
         currentPrompt: undefined, currentTaskId: undefined, currentChain: undefined,
@@ -3413,6 +3461,7 @@ const watchdogTimer = setInterval(() => {
         `[haiflow] task recovered by watchdog (${reason})`);
       recordTaskFinish({ id: state.currentTaskId, session, status: "timed_out", error: `watchdog:${reason}` });
     }
+    descartarArquivoDoPrompt(session);
     writeState(session, {
       status: "idle", since: new Date().toISOString(),
       waiting: false, waitingMessage: undefined, waitingSince: undefined, deadlineAt: undefined,
